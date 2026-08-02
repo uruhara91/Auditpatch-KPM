@@ -121,6 +121,7 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/kallsyms.h>
+#include <asm/atomic.h>
 #include <uapi/asm-generic/unistd.h>
 #include <syscall.h>
 #include <hook.h>
@@ -129,7 +130,7 @@
 #include <asm/current.h>
 
 KPM_NAME("zn-auditpatch-kpm");
-KPM_VERSION("2.0.0");
+KPM_VERSION("2.1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("aviraxp; KP port");
 KPM_DESCRIPTION("Hide su/magisk context from AVC audit logs (+ optional deep SELinux hook)");
@@ -161,10 +162,19 @@ static const char PATTERN_REPLACEMENT[] = "tcontext=" CTX_REPLACEMENT;
 #define PATTERN_MAGISK_LEN (sizeof(PATTERN_MAGISK) - 1)
 #define PATTERN_REPLACEMENT_LEN (sizeof(PATTERN_REPLACEMENT) - 1)
 
-/* Generous upper bound for PART 1's scratch copy. Real AVC lines are a few
- * hundred bytes; MAX_AUDIT_MESSAGE_LENGTH in AOSP libaudit.h is 8970, so
- * this leaves ample headroom while staying a single bounded allocation. */
+/* Hard ceiling for PART 1's scratch copy (defensive upper bound only --
+ * see MAX_ALLOC_HEADROOM below for what actually gets allocated per call).
+ * MAX_AUDIT_MESSAGE_LENGTH in AOSP libaudit.h is 8970, so this leaves
+ * ample headroom while staying a single bounded allocation. */
 #define SCRATCH_MAX 16384
+
+/* The largest a match can possibly grow by: PATTERN_REPLACEMENT_LEN minus
+ * the shortest pattern we match against (PATTERN_SU). Used to right-size
+ * the per-call scratch allocation instead of always grabbing SCRATCH_MAX --
+ * real AVC lines are a few hundred bytes, so this keeps the common-case
+ * allocation in that same ballpark rather than always 16 KiB. */
+#define MAX_GROWTH (PATTERN_REPLACEMENT_LEN - PATTERN_SU_LEN)
+#define ALLOC_HEADROOM (MAX_GROWTH + 16)
 
 /* ------------------------------------------------------------------------
  * State
@@ -172,13 +182,19 @@ static const char PATTERN_REPLACEMENT[] = "tcontext=" CTX_REPLACEMENT;
 
 static char g_target_comm[TASK_COMM_LEN] = DEFAULT_TARGET_COMM;
 
-static volatile uint64_t g_p1_scanned = 0;
-static volatile uint64_t g_p1_patched = 0;
-static volatile uint64_t g_p1_errors = 0;
+/* Plain counters incremented from a hook can run on any CPU concurrently
+ * (recvfrom()/security_sid_to_context() are not serialized against each
+ * other across cores), so these are atomic64_t rather than a bare
+ * volatile uint64_t -- purely so the stats reported by ctl0 can't lose
+ * updates under concurrent access. Nothing security-relevant depends on
+ * these; only the reporting does. */
+static atomic64_t g_p1_scanned = ATOMIC64_INIT(0);
+static atomic64_t g_p1_patched = ATOMIC64_INIT(0);
+static atomic64_t g_p1_errors = ATOMIC64_INIT(0);
 static int g_p1_hooked = 0;
 
-static volatile uint64_t g_p2_patched = 0;
-static volatile uint64_t g_p2_errors = 0;
+static atomic64_t g_p2_patched = ATOMIC64_INIT(0);
+static atomic64_t g_p2_errors = ATOMIC64_INIT(0);
 static int g_p2_hooked = 0;
 static int g_p2_has_state_arg = 0;
 static uint32_t g_p2_gfp_atomic = 0;
@@ -251,6 +267,7 @@ static void after_recvfrom(hook_fargs6_t *args, void *udata)
     uint64_t buf_arg, cap_arg;
     void __user *ubuf;
     int user_cap;
+    int alloc_size;
     long copied;
     int len;
     int patched;
@@ -279,12 +296,19 @@ static void after_recvfrom(hook_fargs6_t *args, void *udata)
     }
     if (ret > user_cap) ret = user_cap;
 
-    g_p1_scanned++;
+    atomic64_inc(&g_p1_scanned);
 
-    scratch = (char *)kp_malloc(SCRATCH_MAX);
+    /* Right-sized, not SCRATCH_MAX: real AVC lines are a few hundred
+     * bytes, so this is typically a tiny fraction of the old fixed 16 KiB
+     * allocation. Still bounded by SCRATCH_MAX for safety regardless of
+     * what `ret` claims. */
+    alloc_size = (int)ret + ALLOC_HEADROOM;
+    if (alloc_size > SCRATCH_MAX - 1) alloc_size = SCRATCH_MAX - 1;
+
+    scratch = (char *)kp_malloc(alloc_size);
     if (!scratch) {
-        g_p1_errors++;
-        pr_err("zn-auditpatch-kpm: [p1] kp_malloc(%d) failed\n", SCRATCH_MAX);
+        atomic64_inc(&g_p1_errors);
+        pr_err("zn-auditpatch-kpm: [p1] kp_malloc(%d) failed\n", alloc_size);
         return;
     }
 
@@ -304,11 +328,11 @@ static void after_recvfrom(hook_fargs6_t *args, void *udata)
     if (patched) {
         if (compat_copy_to_user(ubuf, scratch, len) == 0) {
             args->ret = (uint64_t)len;
-            g_p1_patched++;
-            pr_info("zn-auditpatch-kpm: [p1] patched avc audit tcontext in '%s' (total: %llu)\n", comm,
-                    (unsigned long long)g_p1_patched);
+            atomic64_inc(&g_p1_patched);
+            pr_info("zn-auditpatch-kpm: [p1] patched avc audit tcontext in '%s' (total: %lld)\n", comm,
+                    (long long)atomic64_read(&g_p1_patched));
         } else {
-            g_p1_errors++;
+            atomic64_inc(&g_p1_errors);
             pr_err("zn-auditpatch-kpm: [p1] compat_copy_to_user failed\n");
         }
     }
@@ -378,7 +402,7 @@ static void after_sid_to_context(hook_fargs4_t *args, void *udata)
 
     newbuf = (char *)kmalloc(CTX_REPLACEMENT_LEN + 1, (gfp_t)g_p2_gfp_atomic);
     if (!newbuf) {
-        g_p2_errors++;
+        atomic64_inc(&g_p2_errors);
         pr_err("zn-auditpatch-kpm: [p2] kmalloc failed\n");
         return;
     }
@@ -388,9 +412,9 @@ static void after_sid_to_context(hook_fargs4_t *args, void *udata)
     *scontext_ptr = newbuf;
     *scontext_len_ptr = (uint32_t)CTX_REPLACEMENT_LEN;
 
-    g_p2_patched++;
-    pr_info("zn-auditpatch-kpm: [p2] patched sid->context result (total: %llu)\n",
-            (unsigned long long)g_p2_patched);
+    atomic64_inc(&g_p2_patched);
+    pr_info("zn-auditpatch-kpm: [p2] patched sid->context result (total: %lld)\n",
+            (long long)atomic64_read(&g_p2_patched));
 }
 
 /* Returns 1 and fills *out if running_kver matches a verified table entry,
@@ -485,20 +509,21 @@ static long auditpatch_control0(const char *ctl_args, char *__user out_msg, int 
     int n;
 
     n = snprintf(buf, sizeof(buf),
-                 "p1_hooked=%d target=%s p1_scanned=%llu p1_patched=%llu p1_errors=%llu | "
-                 "p2_hooked=%d p2_has_state=%d p2_gfp_atomic=0x%x p2_patched=%llu p2_errors=%llu\n",
-                 g_p1_hooked, g_target_comm, (unsigned long long)g_p1_scanned, (unsigned long long)g_p1_patched,
-                 (unsigned long long)g_p1_errors, g_p2_hooked, g_p2_has_state_arg, g_p2_gfp_atomic,
-                 (unsigned long long)g_p2_patched, (unsigned long long)g_p2_errors);
+                 "p1_hooked=%d target=%s p1_scanned=%lld p1_patched=%lld p1_errors=%lld | "
+                 "p2_hooked=%d p2_has_state=%d p2_gfp_atomic=0x%x p2_patched=%lld p2_errors=%lld\n",
+                 g_p1_hooked, g_target_comm, (long long)atomic64_read(&g_p1_scanned),
+                 (long long)atomic64_read(&g_p1_patched), (long long)atomic64_read(&g_p1_errors), g_p2_hooked,
+                 g_p2_has_state_arg, g_p2_gfp_atomic, (long long)atomic64_read(&g_p2_patched),
+                 (long long)atomic64_read(&g_p2_errors));
     if (n < 0) n = 0;
     if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
 
     if (ctl_args && !strcmp(ctl_args, "reset")) {
-        g_p1_scanned = 0;
-        g_p1_patched = 0;
-        g_p1_errors = 0;
-        g_p2_patched = 0;
-        g_p2_errors = 0;
+        atomic64_set(&g_p1_scanned, 0);
+        atomic64_set(&g_p1_patched, 0);
+        atomic64_set(&g_p1_errors, 0);
+        atomic64_set(&g_p2_patched, 0);
+        atomic64_set(&g_p2_errors, 0);
         n = snprintf(buf, sizeof(buf), "counters reset\n");
     }
 
@@ -516,8 +541,8 @@ static long auditpatch_exit(void *__user reserved)
         unhook((void *)g_p2_addr);
         g_p2_hooked = 0;
     }
-    pr_info("zn-auditpatch-kpm: exit, p1_patched=%llu p2_patched=%llu\n", (unsigned long long)g_p1_patched,
-            (unsigned long long)g_p2_patched);
+    pr_info("zn-auditpatch-kpm: exit, p1_patched=%lld p2_patched=%lld\n",
+            (long long)atomic64_read(&g_p1_patched), (long long)atomic64_read(&g_p2_patched));
     return 0;
 }
 
