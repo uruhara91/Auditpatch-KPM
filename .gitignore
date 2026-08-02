@@ -1,0 +1,6 @@
+kpm/*.o
+kpm/*.kpm
+toolchain/
+KernelPatch/
+out/
+SHA256SUMS.txt
