@@ -54,16 +54,34 @@ INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 #
 # Deliberately NOT added, despite being tempting:
 # -O3 / -Os: see -O2 note above.
-# -ffreestanding / -fPIC / -fno-PIC: the upstream KernelPatch demo KPMs
-#   (kpms/demo-hello, kpms/demo-syscallhook) build and are confirmed to
-#   load correctly *without* setting any of these, and this project has no
-#   way to test a real .kpm against a real kernel to verify a deviation
-#   from that proven baseline is safe. If you can test on real hardware and
-#   confirm one of these helps (or is needed), that's a much stronger basis
-#   for adding it than reasoning about it in the abstract.
+# -ffreestanding: the upstream KernelPatch demo KPMs (kpms/demo-hello,
+#   kpms/demo-syscallhook) build without it, and adding it changes how GCC
+#   treats builtins in ways that weren't needed once -fno-builtin was
+#   already covering the actual concern (see above). Confirmed via a real
+#   aarch64-linux-gnu-gcc 13.3.0 build + disassembly that the current flag
+#   set alone already produces a clean relocation table (see the
+#   Troubleshooting section in README.md for the -fno-pic/-fno-pie story,
+#   which *was* verified this same way and *did* turn out to matter).
+# -fno-pic -fno-pie: CONFIRMED FIX, not a precaution. Verified empirically:
+#   without these, a real aarch64 GCC (13.3.0, tested via the Ubuntu
+#   aarch64-linux-gnu cross package as the closest available stand-in for
+#   aarch64-none-elf-gcc) emits R_AARCH64_ADR_GOT_PAGE / R_AARCH64_LD64_GOT_LO12_NC
+#   relocations for essentially every external/kfunc call in this file
+#   (printk, kf_memcpy, kf_strcmp, kf_snprintf, ...). KernelPatch's own
+#   relocator (kernel/patch/module/relo.c) does not implement either of
+#   those two relocation types -- it logs "unsupported RELA relocation"
+#   and rejects the module, which fails silently from the embedding side
+#   (the raw bytes get copied into boot.img fine; only the *runtime*
+#   loader at boot rejects it) and matches exactly a KPM that "embeds
+#   without error" but never appears in the active KPM list afterward.
+#   With these two flags, the same file produces zero GOT-relative
+#   relocations, only ones relo.c explicitly handles. This was very likely
+#   caused by the toolchain's own hardening-driven default behavior for
+#   external-symbol references rather than anything -fPIC-specific in the
+#   traditional sense, so it is set explicitly rather than assumed absent.
 CFLAGS ?= -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O2 \
           -fno-strict-aliasing -fno-builtin -fno-stack-protector -fno-common \
-          -fno-asynchronous-unwind-tables -fno-unwind-tables
+          -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-pic -fno-pie
 
 objs := auditpatch.o
 

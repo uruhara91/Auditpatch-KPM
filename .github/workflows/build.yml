@@ -51,9 +51,81 @@ jobs:
           gcc -fsyntax-only -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
             -nostdinc -isystem "$FREESTANDING_INC" $FLAGS kpm/auditpatch.c
 
+  fast-check:
+    name: Fast real-arch check (apt aarch64-linux-gnu-gcc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout KernelPatch headers
+        uses: actions/checkout@v4
+        with:
+          repository: bmax121/KernelPatch
+          ref: ${{ github.event.inputs.kernelpatch_ref != '' && github.event.inputs.kernelpatch_ref || env.KERNELPATCH_REF }}
+          path: KernelPatch
+
+      # This is NOT the toolchain the release build uses (that's the
+      # official aarch64-none-elf- bare-metal ARM GNU Toolchain, downloaded
+      # in the `build` job below) -- it's Ubuntu's apt-installable
+      # aarch64-linux-gnu- cross-gcc, used here purely because it's a real
+      # AArch64-codegen-producing GCC that installs in seconds instead of
+      # minutes. It exists to catch real-codegen bugs (wrong relocation
+      # types, oversized stack frames, etc.) on every push/PR fast, before
+      # the slower official build runs. This is exactly the class of bug
+      # that -fsyntax-only in the `lint` job above cannot catch by
+      # construction (it never invokes an assembler) -- see README.md's
+      # Troubleshooting section for the real bug this caught during
+      # development (missing -fno-pic/-fno-pie caused GOT-relative
+      # relocations KernelPatch's loader silently rejects at boot).
+      - name: Install apt aarch64 cross-gcc + binutils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Build with apt toolchain
+        run: |
+          set -eu
+          aarch64-linux-gnu-gcc --version
+          make -C kpm TARGET_COMPILE=aarch64-linux-gnu- KP_DIR="$GITHUB_WORKSPACE/KernelPatch" clean all
+
+      - name: Verify KPM loadability
+        run: sh kpm/tools/verify-kpm.sh aarch64-linux-gnu-readelf kpm/auditpatch.kpm
+
+      - name: Stack usage guard
+        run: |
+          set -eu
+          INCLUDE_DIRS=". include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include"
+          FLAGS=""
+          for d in $INCLUDE_DIRS; do FLAGS="$FLAGS -I$GITHUB_WORKSPACE/KernelPatch/kernel/$d"; done
+          # Same CFLAGS the Makefile uses, plus -fstack-usage, compiled
+          # standalone here (not via `make`) purely to get the .su
+          # sidecar file without changing the Makefile itself. GCC names
+          # the .su file after the -o path (/tmp/su.o -> /tmp/su.su), not
+          # after the source file.
+          cd kpm
+          aarch64-linux-gnu-gcc -Wall -Wextra -O2 -fno-strict-aliasing -fno-builtin \
+            -fno-stack-protector -fno-common -fno-asynchronous-unwind-tables \
+            -fno-unwind-tables -fno-pic -fno-pie -fstack-usage $FLAGS -c -o /tmp/su.o auditpatch.c
+          echo "Per-function stack usage (bytes):"
+          sort -t "$(printf '\t')" -k2 -rn /tmp/su.su
+          # 2 KiB is generous headroom given the largest function here uses
+          # well under 512 B and a KPM hook runs on top of an unknown,
+          # already-partially-used kernel stack -- this exists to catch a
+          # future change (e.g. a large local buffer/array) accidentally
+          # eating into that shared budget, not because current usage is
+          # anywhere close to the limit.
+          over=$(awk -F'\t' '$2 > 2048 {print}' /tmp/su.su || true)
+          rm -f /tmp/su.su /tmp/su.o
+          if [ -n "$over" ]; then
+            echo "FAIL: function(s) using >2048 bytes of stack:" >&2
+            echo "$over" >&2
+            exit 1
+          fi
+          echo "OK: all functions well under the 2048 B/frame guard"
+
   build:
     name: Build .kpm (aarch64-none-elf)
-    needs: lint
+    needs: [lint, fast-check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,6 +168,9 @@ jobs:
           file kpm/auditpatch.kpm
           ls -l kpm/auditpatch.kpm
           "$GITHUB_WORKSPACE"/toolchain/bin/aarch64-none-elf-readelf -h kpm/auditpatch.kpm
+
+      - name: Verify KPM loadability
+        run: sh kpm/tools/verify-kpm.sh "$GITHUB_WORKSPACE/toolchain/bin/aarch64-none-elf-readelf" kpm/auditpatch.kpm
 
       - name: Checksum
         run: |

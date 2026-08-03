@@ -201,10 +201,23 @@ make -C kpm KP_DIR="$PWD/KernelPatch"
 # -> kpm/auditpatch.kpm
 ```
 
-The `.github/workflows/build.yml` action does exactly this on every push
-and pull request (plus a fast host-`gcc` `-fsyntax-only` lint pass against
-the real KernelPatch headers), and attaches `auditpatch.kpm` to tagged
-releases (`vX.Y.Z`).
+The `.github/workflows/build.yml` action builds this three ways on every
+push and pull request:
+1. `lint` — fast host-`gcc` `-fsyntax-only` pass against the real
+   KernelPatch headers (catches type/API mistakes; cannot catch codegen or
+   relocation issues, since it never invokes an assembler).
+2. `fast-check` — a *real* AArch64 build using Ubuntu's apt-installable
+   `gcc-aarch64-linux-gnu` (installs in seconds, unlike the full ARM
+   toolchain below), then `kpm/tools/verify-kpm.sh` checks the actual
+   output is something KernelPatch's loader will accept (see
+   **Troubleshooting**), plus a stack-usage budget check.
+3. `build` — the real release build with the official
+   `aarch64-none-elf-` toolchain, running the same `verify-kpm.sh` check
+   against its output before attaching `auditpatch.kpm` to tagged releases
+   (`vX.Y.Z`).
+
+You can run the same loadability check locally against your own build:
+`sh kpm/tools/verify-kpm.sh <path-to-readelf> kpm/auditpatch.kpm`.
 
 ## Installing
 
@@ -247,6 +260,54 @@ kpatch "$SUPERKEY" kpm ctl0 zn-auditpatch-kpm reset   # zero the counters
 match a verified table entry above — PART 1 is still fully active in that
 case.
 
+## Troubleshooting: "Embed" succeeds but the KPM never shows up as loaded
+
+**Fixed in v2.1.1 — was a real bug, not a config/usage issue, if you're on
+an earlier version.** Symptom: APatch Manager's "Embed KPM" step reports no
+error, but after flashing and rebooting the module never appears in
+APatch Manager's active-KPM list (as opposed to the "Existed/staged KPM"
+list, which just reflects what's embedded in boot.img, not what actually
+loaded), and there is no `zn-auditpatch-kpm: init, ...` line anywhere in
+`dmesg`.
+
+Root cause, confirmed by actually disassembling a real `aarch64` build of
+this module (not just syntax-checking it, which is all that's possible
+without a real cross toolchain — see the note in **Building** above): a
+real `aarch64` GCC, without `-fno-pic -fno-pie` set explicitly, emits
+`R_AARCH64_ADR_GOT_PAGE` / `R_AARCH64_LD64_GOT_LO12_NC` relocations for
+essentially every external/kfunc call in this file (`printk`, `kf_memcpy`,
+`kf_strcmp`, `kf_snprintf`, ... — almost everything). KernelPatch's own ELF
+relocator (`kernel/patch/module/relo.c`) does not implement either of those
+two relocation types; it logs `unsupported RELA relocation` and rejects
+the module outright. That rejection happens at **runtime, at boot**, not
+at embed time — "Embed" just copies the raw bytes into `boot.img`, it
+doesn't validate that KernelPatch's loader will actually accept them. That
+matches this symptom exactly: no error during Embed, module silently
+absent afterward, no init log because `.kpm.init` never got far enough to
+run.
+
+The Makefile now sets `-fno-pic -fno-pie` and this was verified concretely
+(not just reasoned about): compiled with real `aarch64-linux-gnu-gcc`
+13.3.0 (the closest available stand-in for `aarch64-none-elf-gcc` in the
+environment this was fixed in), the object file went from containing
+`R_AARCH64_ADR_GOT_PAGE`/`R_AARCH64_LD64_GOT_LO12_NC` relocations on nearly
+every function call, to zero of them (174 relocations total, every single
+one from the small set `relo.c` explicitly handles), with `.kpm.info`,
+`.kpm.init`/`.kpm.ctl0`/`.kpm.exit`, and the symbol table all intact and
+correctly section-flagged. If you built an earlier version yourself,
+rebuilding with the current Makefile should be sufficient — no source
+changes were needed, only the compiler flags.
+
+If you rebuild and it *still* doesn't show up, the next things to check,
+in order of how directly they answer "did it load at all":
+1. `kpatch "$SUPERKEY" kpm list` right after a fresh reboot (most direct;
+   doesn't depend on dmesg not having rotated the relevant lines out yet).
+2. `dmesg | grep -iE "kpm|zn-auditpatch"` immediately after boot.
+3. `file auditpatch.kpm` should say `ELF 64-bit LSB relocatable, ARM
+   aarch64`; if your build pipeline downloaded something else (an HTML
+   error page saved with a `.kpm` extension, for instance), that's a
+   packaging/download problem rather than anything about this module.
+
 ## Configuring the target process
 
 By default the hook only ever looks at `recvfrom()` calls made by a process
@@ -279,6 +340,43 @@ kpatch "$SUPERKEY" kpm load /path/to/auditpatch.kpm my_logd_wrapper
   audit logs / context-introspection callers. This is not a security
   hardening tool; it does not change what the device's access-control
   policy actually allows or denies.
+- Unloading a running KPM (`kpm unload`, e.g. via APatch Manager's KPM
+  screen after using "Load") is not fully synchronized against concurrent
+  execution: `unload_module()` in KernelPatch's own
+  `kernel/patch/module/module.c` calls the module's `exit()` and then
+  immediately frees its executable memory with no wait for other CPUs to
+  finish executing code from it (the function is literally preceded by a
+  `// todo: lock` comment upstream). This is a framework-level gap shared
+  by every KPM, not something specific to this one, and not something a
+  KPM author can fix from outside KernelPatch itself. Practical effect:
+  prefer **Embed** over repeated **Load**/unload cycles for anything other
+  than short testing sessions, since Embed never goes through this
+  runtime-unload path at all.
+
+## Hardening / correctness notes
+
+A few things worth stating plainly rather than leaving implicit, from
+actually compiling this to real AArch64 object code (see **Troubleshooting**
+above) and inspecting the result rather than just reasoning about it:
+
+- **Stack usage is small and checked in CI.** The largest function
+  (`auditpatch_control0`, which holds a 320-byte reply buffer) uses 448
+  bytes per `-fstack-usage`; everything else is well under 128 bytes. CI's
+  `fast-check` job fails the build if any function exceeds a 2 KiB budget,
+  as a guard against a future change accidentally adding a large local
+  buffer on top of an unknown, already-partially-used kernel stack.
+- **Statistics counters are genuinely atomic**, not just `volatile`:
+  `g_p1_scanned`/`g_p1_patched`/`g_p1_errors`/`g_p2_patched`/`g_p2_errors`
+  are `atomic64_t`, confirmed by disassembly to compile to real
+  `ldxr`/`stxr` load-/store-exclusive sequences (not a plain
+  load-increment-store that could lose updates if both PART 1 and PART 2
+  fire on different CPUs at the same moment). Nothing security-relevant
+  depends on these being exact — only the `ctl0 status` reporting does —
+  but there's no reason for them to be sloppy either.
+- **Every relocation type the build actually produces is one KernelPatch's
+  loader implements**, enforced by `kpm/tools/verify-kpm.sh` in both CI
+  jobs (see Troubleshooting) — not just "it compiled", which as v2.1.0
+  demonstrated is not sufficient on its own to mean it will load.
 
 ## Credits / license
 

@@ -130,7 +130,7 @@
 #include <asm/current.h>
 
 KPM_NAME("zn-auditpatch-kpm");
-KPM_VERSION("2.1.0");
+KPM_VERSION("2.1.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("aviraxp; KP port");
 KPM_DESCRIPTION("Hide su/magisk context from AVC audit logs (+ optional deep SELinux hook)");
