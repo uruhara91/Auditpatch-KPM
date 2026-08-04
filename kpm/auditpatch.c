@@ -36,11 +36,12 @@
  *     syscall's return value (byte count) to match.
  *
  * This only ever touches a *userspace* buffer through the safe, documented
- * compat_copy_to_user()/compat_strncpy_from_user() primitives. It never
- * allocates a kernel object that other kernel code later frees, so it has
- * no allocator-ownership concerns and needs no kernel-version-specific
- * tuning. It is always installed, on every kernel KernelPatch itself runs
- * on.
+ * compat_copy_to_user()/compat_strncpy_from_user() primitives, and its own
+ * scratch copy is a fixed-size buffer on the stack (see SCRATCH_BUF_SIZE) --
+ * not a kernel allocator of any kind. It never allocates a kernel object
+ * that other kernel code later frees, so it has no allocator-ownership
+ * concerns and needs no kernel-version-specific tuning. It is always
+ * installed, on every kernel KernelPatch itself runs on.
  *
  * ===========================================================================
  * PART 2: the deep security_sid_to_context hook (version-gated, best-effort)
@@ -72,37 +73,50 @@
  *    android-5.4-stable, android12-5.10, android13-5.15, android14-6.1 and
  *    android15-6.6, which all matched their mainline-version expectation.
  *
- * 2. Object lifetime. The buffer `*scontext` points to is a real
- *    kmalloc()'d kernel object that the *caller* eventually kfree()s (this
- *    was verified directly in security/selinux/avc.c:avc_audit_post_callback
- *    and fs/proc/base.c:proc_pid_attr_read, both of which kfree() it after
- *    use). Swapping in a differently-sourced buffer (e.g. this KPM's own
- *    kp_malloc() allocator) would hand the kernel's real kfree() a pointer
- *    it never allocated -- silent heap corruption waiting to happen. So the
- *    replacement buffer here is allocated with the kernel's *real*
- *    kmalloc()/kfree() (exposed by KernelPatch as kfuncs), which is safe to
- *    free later by anyone.
+ * 2. Object lifetime and allocator availability. The buffer `*scontext`
+ *    points to is a real kernel object that the *caller* eventually
+ *    frees (verified directly in security/selinux/avc.c's
+ *    avc_audit_post_callback and fs/proc/base.c's proc_pid_attr_read,
+ *    both of which kfree() it after use, and in
+ *    security/selinux/ss/services.c's context_struct_to_string, which
+ *    allocates it with a plain kstrdup() -- exactly strlen()+1 bytes, no
+ *    slack). This module used to swap in a freshly kmalloc()'d
+ *    replacement buffer here, reasoning that this KPM's own kp_malloc()
+ *    allocator (used in PART 1's scratch buffer at the time) would hand
+ *    the kernel's real kfree() a pointer it never allocated. That
+ *    reasoning about kfree() compatibility was correct, but it turned out
+ *    to rest on a wrong assumption in the other direction: on the device
+ *    this was actually debugged against, a bug report's boot log showed
+ *    the *entire module* failing to load ("unknown symbol", rc=-2 /
+ *    -ENOENT from KernelPatch's own kernel/patch/module/module.c) because
+ *    kf_kmalloc, kf___kmalloc, kf_kfree, tlsf_malloc, tlsf_free, and
+ *    kp_rw_mem were *all* absent from that build's exported symbol table
+ *    -- not just the real kernel's kmalloc()/kfree(), but also
+ *    kp_malloc()/kp_free() themselves, since kpmalloc.h's kp_malloc() and
+ *    kp_free() are `static inline` wrappers around exactly
+ *    tlsf_malloc()/tlsf_free()/kp_rw_mem. Neither allocator was actually
+ *    reliably present; only one of the two failures was visible at first
+ *    because the other was hidden behind inlining. In other words: no
+ *    kernel-object allocator this module could call -- KernelPatch's own
+ *    or the real kernel's -- is a safe assumption to depend on across
+ *    KernelPatch builds.
  *
- *    kmalloc() needs a GFP flags value, and some callers of
- *    security_sid_to_context() (avc_audit_post_callback, specifically) can
- *    run under rcu_read_lock() in a non-sleepable context, so GFP_ATOMIC is
- *    required -- but GFP_ATOMIC's actual *numeric* value is not a stable
- *    ABI constant (KernelPatch's own public headers leave it unimplemented
- *    for exactly this reason) and has in fact changed across kernel
- *    history: verified directly from source, ___GFP_DIRECT_RECLAIM alone
- *    moved from 0x200000 (v4.19) to 0x400 (v5.15), a different bit
- *    position entirely. Guessing a single value to cover every kernel would
- *    silently be wrong on some of them.
+ *    So neither part of this module allocates kernel objects anymore.
+ *    PART 2 overwrites the existing context buffer *in place*, which
+ *    means the replacement text can never be longer than the shortest
+ *    pattern it might replace (see CTX_REPLACEMENT_SHORT below) -- a real
+ *    cosmetic downgrade from a freely-sized replacement, accepted
+ *    deliberately in exchange for the module actually loading. PART 1
+ *    (see after_recvfrom) switched its scratch buffer from kp_malloc() to
+ *    a fixed-size buffer on the stack, which needs no allocator symbol at
+ *    all since it never leaves the function or outlives the call.
  *
- *    So this module ships a small table of GFP_ATOMIC values and the ABI
- *    shape, each individually verified against real kernel source (see
- *    SID2CTX_ABI_TABLE below). On a kernel version that matches a table
- *    entry, the deep hook installs. On anything else, it does not -- it is
- *    left disabled rather than guessed at, and PART 1 (recvfrom/logd) keeps
- *    working regardless. This is deliberately conservative: extending the
- *    table to a kernel version not listed here requires checking that
- *    version's real security.h and gfp.h/gfp_types.h, the same way this
- *    table was built, not adding a plausible-looking guess.
+ * Kernel-version ABI shape is still tracked in SID2CTX_ABI_TABLE below
+ * (only has_state_arg now, since there's no GFP flag to get right anymore
+ * -- see git history if you want the version that needed one). On a
+ * kernel version that matches a table entry, the deep hook installs. On
+ * anything else, it does not -- it is left disabled rather than guessed
+ * at, and PART 1 (recvfrom/logd) keeps working regardless.
  *
  * Unlike PART 1, the deep hook cannot distinguish "su/magisk is the target
  * of a denial" from "su/magisk is the source" (or, for that matter, from
@@ -119,18 +133,16 @@
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
-#include <linux/slab.h>
 #include <linux/kallsyms.h>
 #include <asm/atomic.h>
 #include <uapi/asm-generic/unistd.h>
 #include <syscall.h>
 #include <hook.h>
 #include <kputils.h>
-#include <kpmalloc.h>
 #include <asm/current.h>
 
 KPM_NAME("zn-auditpatch-kpm");
-KPM_VERSION("2.1.1");
+KPM_VERSION("2.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("aviraxp; KP port");
 KPM_DESCRIPTION("Hide su/magisk context from AVC audit logs (+ optional deep SELinux hook)");
@@ -151,6 +163,20 @@ KPM_DESCRIPTION("Hide su/magisk context from AVC audit logs (+ optional deep SEL
 #define CTX_REPLACEMENT "u:r:priv_app:s0:c512,c768"
 #define CTX_REPLACEMENT_LEN (sizeof(CTX_REPLACEMENT) - 1)
 
+/* PART 2 (see after_sid_to_context) can only ever overwrite the existing
+ * context buffer *in place* -- see the long comment above PART 2 for why
+ * it cannot allocate a replacement the way PART 1 does. That means its
+ * replacement must never be longer than the shortest pattern it might
+ * replace (CTX_SU, 9 bytes), since context_struct_to_string() allocates
+ * exactly strlen(original)+1 bytes with zero slack (confirmed against
+ * real kernel source: it's a plain kstrdup()). Deliberately short and
+ * generic rather than a closer copy of CTX_REPLACEMENT above -- being
+ * unable to grow the buffer is the binding constraint here, not stylistic
+ * preference.
+ */
+#define CTX_REPLACEMENT_SHORT "u:r:na:s0"
+#define CTX_REPLACEMENT_SHORT_LEN (sizeof(CTX_REPLACEMENT_SHORT) - 1)
+
 /* PART 1 matches inside a formatted log line, so it needs the "tcontext="
  * prefix glued on (plain C string literal concatenation). Only tcontext=,
  * never scontext=, exactly like upstream ZN-AuditPatch. */
@@ -162,17 +188,30 @@ static const char PATTERN_REPLACEMENT[] = "tcontext=" CTX_REPLACEMENT;
 #define PATTERN_MAGISK_LEN (sizeof(PATTERN_MAGISK) - 1)
 #define PATTERN_REPLACEMENT_LEN (sizeof(PATTERN_REPLACEMENT) - 1)
 
-/* Hard ceiling for PART 1's scratch copy (defensive upper bound only --
- * see MAX_ALLOC_HEADROOM below for what actually gets allocated per call).
- * MAX_AUDIT_MESSAGE_LENGTH in AOSP libaudit.h is 8970, so this leaves
- * ample headroom while staying a single bounded allocation. */
-#define SCRATCH_MAX 16384
+/* sizeof() is a compiler construct, not something the preprocessor can
+ * evaluate in #if, so this constraint is enforced with a real compile-time
+ * assertion instead of #if/#error. */
+_Static_assert(CTX_REPLACEMENT_SHORT_LEN <= (sizeof(CTX_SU) - 1),
+                "CTX_REPLACEMENT_SHORT must never be longer than CTX_SU (see comment above)");
+
+/* PART 1's scratch copy is a fixed-size buffer *on the stack*, not a
+ * kp_malloc()/kp_free() allocation -- see the long comment above
+ * after_recvfrom() for why kp_malloc()/kp_free() (backed by
+ * tlsf_malloc()/tlsf_free()/kp_rw_mem under the hood) turned out not to be
+ * a safe assumption either. 1536 bytes comfortably covers real AVC audit
+ * lines (a few hundred bytes in practice; MAX_AUDIT_MESSAGE_LENGTH in AOSP
+ * libaudit.h is 8970 as a theoretical ceiling, but a hook running on top
+ * of an unknown, already-partially-used kernel stack has no business
+ * reserving anything close to that) while staying well inside the
+ * fast-check CI job's stack-usage budget for this function. A read that
+ * doesn't fit is simply left unpatched rather than truncated or
+ * overflowed -- see the size check in after_recvfrom(). */
+#define SCRATCH_BUF_SIZE 1536
 
 /* The largest a match can possibly grow by: PATTERN_REPLACEMENT_LEN minus
- * the shortest pattern we match against (PATTERN_SU). Used to right-size
- * the per-call scratch allocation instead of always grabbing SCRATCH_MAX --
- * real AVC lines are a few hundred bytes, so this keeps the common-case
- * allocation in that same ballpark rather than always 16 KiB. */
+ * the shortest pattern we match against (PATTERN_SU). Used to make sure
+ * there's room left in SCRATCH_BUF_SIZE for growth, not just the raw
+ * bytes read. */
 #define MAX_GROWTH (PATTERN_REPLACEMENT_LEN - PATTERN_SU_LEN)
 #define ALLOC_HEADROOM (MAX_GROWTH + 16)
 
@@ -197,7 +236,6 @@ static atomic64_t g_p2_patched = ATOMIC64_INIT(0);
 static atomic64_t g_p2_errors = ATOMIC64_INIT(0);
 static int g_p2_hooked = 0;
 static int g_p2_has_state_arg = 0;
-static uint32_t g_p2_gfp_atomic = 0;
 static uint64_t g_p2_addr = 0;
 
 /* ==========================================================================
@@ -260,6 +298,20 @@ static int try_patch_one(char *buf, int *len, int cap, const char *pattern, int 
 /*
  * after-hook on recvfrom(int sockfd, void *buf, size_t len, int flags,
  *                        struct sockaddr *src_addr, socklen_t *addrlen)
+ *
+ * Uses a fixed-size on-stack scratch buffer, not kp_malloc()/kp_free().
+ * That switch (from an earlier version of this module that did use
+ * kp_malloc()/kp_free()) exists for the same reason PART 2 no longer
+ * allocates at all: kp_malloc()/kp_free() are static inline wrappers
+ * around tlsf_malloc()/tlsf_free()/kp_rw_mem (see kpmalloc.h), and those
+ * turned out to be exactly the symbols missing from the KernelPatch build
+ * this was actually debugged against -- "unknown symbol: tlsf_malloc" /
+ * "tlsf_free" / "kp_rw_mem", right alongside the kmalloc()/kfree() ones,
+ * in the same failed load. A scratch buffer that's purely local to this
+ * function -- never handed to any other kernel code, never outliving this
+ * call -- has no reason to go through a kernel allocator of any kind in
+ * the first place; a fixed-size local array sidesteps the whole class of
+ * problem.
  */
 static void after_recvfrom(hook_fargs6_t *args, void *udata)
 {
@@ -267,11 +319,10 @@ static void after_recvfrom(hook_fargs6_t *args, void *udata)
     uint64_t buf_arg, cap_arg;
     void __user *ubuf;
     int user_cap;
-    int alloc_size;
     long copied;
     int len;
     int patched;
-    char *scratch;
+    char scratch[SCRATCH_BUF_SIZE];
     struct task_struct *task;
     const char *comm;
 
@@ -289,34 +340,23 @@ static void after_recvfrom(hook_fargs6_t *args, void *udata)
     ubuf = (void __user *)buf_arg;
 
     cap_arg = syscall_argn(args, 2);
-    if (cap_arg == 0 || cap_arg > (uint64_t)(SCRATCH_MAX - 1)) {
-        user_cap = SCRATCH_MAX - 1;
+    if (cap_arg == 0 || cap_arg > (uint64_t)(SCRATCH_BUF_SIZE - 1)) {
+        user_cap = SCRATCH_BUF_SIZE - 1;
     } else {
         user_cap = (int)cap_arg;
     }
     if (ret > user_cap) ret = user_cap;
 
+    /* Doesn't fit our fixed scratch buffer with room for growth -- leave
+     * it unpatched rather than truncate or overflow. Real AVC lines are a
+     * few hundred bytes, so this should essentially never trigger; if it
+     * does, PART 1 just silently doesn't cover that one oversized read. */
+    if (ret + ALLOC_HEADROOM > (int)sizeof(scratch)) return;
+
     atomic64_inc(&g_p1_scanned);
 
-    /* Right-sized, not SCRATCH_MAX: real AVC lines are a few hundred
-     * bytes, so this is typically a tiny fraction of the old fixed 16 KiB
-     * allocation. Still bounded by SCRATCH_MAX for safety regardless of
-     * what `ret` claims. */
-    alloc_size = (int)ret + ALLOC_HEADROOM;
-    if (alloc_size > SCRATCH_MAX - 1) alloc_size = SCRATCH_MAX - 1;
-
-    scratch = (char *)kp_malloc(alloc_size);
-    if (!scratch) {
-        atomic64_inc(&g_p1_errors);
-        pr_err("zn-auditpatch-kpm: [p1] kp_malloc(%d) failed\n", alloc_size);
-        return;
-    }
-
     copied = compat_strncpy_from_user(scratch, (const char __user *)ubuf, ret);
-    if (copied <= 0) {
-        kp_free(scratch);
-        return;
-    }
+    if (copied <= 0) return;
 
     len = (int)copied;
 
@@ -336,8 +376,6 @@ static void after_recvfrom(hook_fargs6_t *args, void *udata)
             pr_err("zn-auditpatch-kpm: [p1] compat_copy_to_user failed\n");
         }
     }
-
-    kp_free(scratch);
 }
 
 /* ==========================================================================
@@ -348,7 +386,6 @@ struct sid2ctx_abi {
     uint32_t kver_min; /* inclusive */
     uint32_t kver_max; /* exclusive */
     int has_state_arg; /* security_sid_to_context(state, sid, ...) vs (sid, ...) */
-    uint32_t gfp_atomic; /* verified GFP_ATOMIC bit value for this range */
     const char *note;
 };
 
@@ -361,13 +398,12 @@ struct sid2ctx_abi {
  */
 static const struct sid2ctx_abi SID2CTX_ABI_TABLE[] = {
     /* android-4.19-stable and mainline v4.19 (covers e.g. 4.19.191) */
-    { VERSION(4, 19, 0), VERSION(5, 0, 0), 1, 0x00480020u, "4.19.x" },
+    { VERSION(4, 19, 0), VERSION(5, 0, 0), 1, "4.19.x" },
     /* android-5.4-stable, android12-5.10, android13-5.15, android14-6.1,
      * and mainline v5.4/v5.10/v5.15/v6.1 */
-    { VERSION(5, 0, 0), VERSION(6, 4, 0), 1, 0x00000A20u, "5.4.x-6.3.x" },
-    /* android15-6.6 and mainline v6.4/v6.6/v6.12 (state arg dropped again;
-     * GFP_ATOMIC's composition also changed -- no __GFP_ATOMIC component) */
-    { VERSION(6, 4, 0), VERSION(7, 0, 0), 0, 0x00000820u, "6.4.x+" },
+    { VERSION(5, 0, 0), VERSION(6, 4, 0), 1, "5.4.x-6.3.x" },
+    /* android15-6.6 and mainline v6.4/v6.6/v6.12 (state arg dropped again) */
+    { VERSION(6, 4, 0), VERSION(7, 0, 0), 0, "6.4.x+" },
 };
 
 #define SID2CTX_ABI_TABLE_LEN (sizeof(SID2CTX_ABI_TABLE) / sizeof(SID2CTX_ABI_TABLE[0]))
@@ -376,13 +412,24 @@ static const struct sid2ctx_abi SID2CTX_ABI_TABLE[] = {
  * after-hook on security_sid_to_context(), 4 argument slots captured
  * unconditionally (harmless to over-capture one unused register on the
  * 3-arg ABI -- see g_p2_has_state_arg branch below).
+ *
+ * Deliberately never allocates. Real kernel kmalloc()/kfree() are NOT a
+ * safe default assumption across KernelPatch builds -- confirmed the hard
+ * way: on the device this was debugged against, kmalloc()/kfree() (and
+ * their underlying kf_kmalloc, kf___kmalloc, kf_kfree, tlsf_malloc,
+ * tlsf_free, and kp_rw_mem symbols) were simply absent from that build's
+ * exported symbol table, which made the *entire module* fail to load
+ * ("unknown symbol", rc=-2 / -ENOENT from KernelPatch's own module.c)
+ * even though every other symbol it needs (including kp_malloc/kp_free,
+ * used by PART 1) resolved fine. So PART 2 only ever overwrites the
+ * existing buffer in place -- see the CTX_REPLACEMENT_SHORT comment above
+ * for why that bounds what the replacement can say.
  */
 static void after_sid_to_context(hook_fargs4_t *args, void *udata)
 {
     char **scontext_ptr;
     uint32_t *scontext_len_ptr;
     char *scontext;
-    char *newbuf;
 
     if ((int)args->ret != 0) return; /* only patch successful conversions */
 
@@ -400,17 +447,16 @@ static void after_sid_to_context(hook_fargs4_t *args, void *udata)
 
     if (strcmp(scontext, CTX_SU) && strcmp(scontext, CTX_MAGISK)) return;
 
-    newbuf = (char *)kmalloc(CTX_REPLACEMENT_LEN + 1, (gfp_t)g_p2_gfp_atomic);
-    if (!newbuf) {
-        atomic64_inc(&g_p2_errors);
-        pr_err("zn-auditpatch-kpm: [p2] kmalloc failed\n");
-        return;
-    }
-    memcpy(newbuf, CTX_REPLACEMENT, CTX_REPLACEMENT_LEN + 1);
-
-    kfree(scontext);
-    *scontext_ptr = newbuf;
-    *scontext_len_ptr = (uint32_t)CTX_REPLACEMENT_LEN;
+    /* CTX_REPLACEMENT_SHORT_LEN <= strlen(CTX_SU) is enforced at compile
+     * time above, and CTX_SU is the shorter of the two patterns we match,
+     * so this write (including its NUL) always fits inside the buffer
+     * context_struct_to_string() originally kstrdup()'d -- confirmed
+     * against real kernel source that it allocates exactly
+     * strlen(original)+1 bytes, no slack. Same pointer, same allocation,
+     * untouched otherwise: whoever eventually kfree()s *scontext_ptr
+     * still frees exactly what security_sid_to_context() gave them. */
+    memcpy(scontext, CTX_REPLACEMENT_SHORT, CTX_REPLACEMENT_SHORT_LEN + 1);
+    *scontext_len_ptr = (uint32_t)CTX_REPLACEMENT_SHORT_LEN;
 
     atomic64_inc(&g_p2_patched);
     pr_info("zn-auditpatch-kpm: [p2] patched sid->context result (total: %lld)\n",
@@ -440,7 +486,7 @@ static void install_deep_hook(void)
 
     if (!sid2ctx_abi_lookup(kver, &abi)) {
         pr_warn(
-            "zn-auditpatch-kpm: [p2] kernel version 0x%x has no verified GFP_ATOMIC/ABI "
+            "zn-auditpatch-kpm: [p2] kernel version 0x%x has no verified ABI "
             "table entry, deep hook left DISABLED (part 1 / logd hook still active)\n",
             kver);
         return;
@@ -453,7 +499,6 @@ static void install_deep_hook(void)
     }
 
     g_p2_has_state_arg = abi->has_state_arg;
-    g_p2_gfp_atomic = abi->gfp_atomic;
 
     err = hook_wrap((void *)g_p2_addr, 4, NULL, after_sid_to_context, NULL);
     if (err) {
@@ -510,11 +555,10 @@ static long auditpatch_control0(const char *ctl_args, char *__user out_msg, int 
 
     n = snprintf(buf, sizeof(buf),
                  "p1_hooked=%d target=%s p1_scanned=%lld p1_patched=%lld p1_errors=%lld | "
-                 "p2_hooked=%d p2_has_state=%d p2_gfp_atomic=0x%x p2_patched=%lld p2_errors=%lld\n",
+                 "p2_hooked=%d p2_has_state=%d p2_patched=%lld p2_errors=%lld\n",
                  g_p1_hooked, g_target_comm, (long long)atomic64_read(&g_p1_scanned),
                  (long long)atomic64_read(&g_p1_patched), (long long)atomic64_read(&g_p1_errors), g_p2_hooked,
-                 g_p2_has_state_arg, g_p2_gfp_atomic, (long long)atomic64_read(&g_p2_patched),
-                 (long long)atomic64_read(&g_p2_errors));
+                 g_p2_has_state_arg, (long long)atomic64_read(&g_p2_patched), (long long)atomic64_read(&g_p2_errors));
     if (n < 0) n = 0;
     if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
 

@@ -97,52 +97,60 @@ even from plain context introspection with no denial involved at all. It
 patches *every* successful resolution of the su/magisk domain SID to a
 string.
 
-**This is intentionally conservative about which kernels it runs on.** Two
-things make this hook meaningfully riskier than the recvfrom one, and both
-are handled explicitly rather than glossed over:
+**This is intentionally conservative about which kernels it runs on**,
+because of one real risk that's handled explicitly rather than glossed
+over: **ABI shape.** `security_sid_to_context()`'s C signature has changed
+twice in kernel history:
+```
+< 4.19       : security_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)
+4.19 – 6.3   : security_sid_to_context(struct selinux_state *state, u32 sid, char **scontext, u32 *scontext_len)
+6.4 +        : back to the 3-argument form
+```
+Getting this wrong means reading an unrelated register as if it were a
+pointer and dereferencing it — a real kernel-panic risk, not a
+hypothetical one. So this module ships a short table of
+`(kernel version range → ABI shape)`, with every row individually checked
+against real kernel source — both mainline `torvalds/linux` tags and the
+actual Android common-kernel branches:
 
-1. **ABI shape.** `security_sid_to_context()`'s C signature has changed
-   twice in kernel history:
-   ```
-   < 4.19       : security_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)
-   4.19 – 6.3   : security_sid_to_context(struct selinux_state *state, u32 sid, char **scontext, u32 *scontext_len)
-   6.4 +        : back to the 3-argument form
-   ```
-2. **Object lifetime.** The returned `*scontext` buffer is a real
-   `kmalloc()`'d kernel object that the *caller* later `kfree()`s (verified
-   directly against `avc_audit_post_callback()` and `proc_pid_attr_read()`
-   in real kernel source). Swapping in a buffer from a different allocator
-   would eventually hand the kernel's real `kfree()` a pointer it never
-   allocated — silent heap corruption. So the replacement is allocated with
-   the kernel's *real* `kmalloc()`, which needs a `GFP_ATOMIC` flag (some
-   callers run under `rcu_read_lock()`, non-sleepable) — and that flag's
-   *numeric value* is not stable ABI and has changed across kernel history
-   (confirmed from source: `___GFP_DIRECT_RECLAIM` alone moved from
-   `0x200000` on 4.19 to `0x400` on 5.15 — a different bit position).
-
-So rather than guess a single value and hope, this module ships a short
-table of `(kernel version range → ABI shape, GFP_ATOMIC value)`, with every
-row individually checked against real kernel source — both mainline
-`torvalds/linux` tags and the actual Android common-kernel branches:
-
-| kernel version | `security_sid_to_context` shape | `GFP_ATOMIC` | verified against |
-|---|---|---|---|
-| `< 4.19` | 3-arg (no state) | *not verified* — hook stays off | mainline v4.4, v4.9 |
-| `4.19 – 5.0` | 4-arg (`state` first) | `0x00480020` | `android-4.19-stable` (covers e.g. **4.19.191**), mainline v4.19 |
-| `5.0 – 6.4` | 4-arg (`state` first) | `0x00000A20` | `android-5.4-stable`, `android12-5.10`, `android13-5.15`, `android14-6.1`, mainline v5.4/v5.10/v5.15/v6.1 |
-| `6.4 +` | 3-arg (no state) | `0x00000820` | `android15-6.6`, mainline v6.4/v6.6/v6.12 |
+| kernel version | `security_sid_to_context` shape | verified against |
+|---|---|---|
+| `< 4.19` | 3-arg (no state) — *not verified, hook stays off* | mainline v4.4, v4.9 |
+| `4.19 – 5.0` | 4-arg (`state` first) | `android-4.19-stable` (covers e.g. **4.19.191**), mainline v4.19 |
+| `5.0 – 6.4` | 4-arg (`state` first) | `android-5.4-stable`, `android12-5.10`, `android13-5.15`, `android14-6.1`, mainline v5.4/v5.10/v5.15/v6.1 |
+| `6.4 +` | 3-arg (no state) | `android15-6.6`, mainline v6.4/v6.6/v6.12 |
 
 On boot, the module checks the running kernel version (KernelPatch's `kver`)
 against this table. **A match → the deep hook installs. No match → it is
 left disabled, on purpose, and only the recvfrom/logd hook (PART 1) is
 active.** Extending the table to a kernel version not listed here means
-checking that version's real `security.h` and `gfp.h`/`gfp_types.h` first,
-the same way this table was built — not adding a plausible-looking row.
+checking that version's real `security.h` first, the same way this table
+was built — not adding a plausible-looking row.
 
 If you're on a kernel this table doesn't cover and want it added, the most
 useful thing you can hand over is the exact kernel version/branch (e.g.
 `android13-5.15` or a specific commit/tag), so the same source-level
 verification can be done for it specifically instead of guessed generically.
+
+**Why the PART 2 replacement text is short and generic
+(`u:r:na:s0`), not the fuller `u:r:priv_app:s0:c512,c768` PART 1 uses:**
+the buffer `security_sid_to_context()` returns is a real kernel object
+(`kstrdup()`'d, verified from source: exactly `strlen(original)+1` bytes,
+zero slack) that unrelated kernel code later `kfree()`s. An earlier version
+of this module allocated a fresh, freely-sized replacement buffer for this
+using the real kernel's `kmalloc()`, reasoning that swapping in a buffer
+from a different allocator would eventually hand the kernel's real
+`kfree()` a pointer it never allocated. That reasoning about `kfree()`
+compatibility held up, but the *allocator itself* turned out not to be a
+safe assumption: see **Troubleshooting** below for how a real bug report
+showed `kmalloc()`/`kfree()` (and even this KPM's own `kp_malloc()`) simply
+weren't exported symbols on one real device, which failed the entire
+module's load. So PART 2 now only ever overwrites the existing buffer *in
+place*, which means its replacement can never be longer than the shortest
+pattern it might replace (`u:r:su:s0`, 9 bytes) — a real cosmetic
+downgrade, accepted deliberately in exchange for the module actually
+loading rather than depending on an allocator kfunc that isn't universally
+exported.
 
 **What this module deliberately does *not* do:** projects like
 [Admirepowered/selinux_hook](https://github.com/Admirepowered/selinux_hook)
@@ -252,7 +260,7 @@ module script or an adb shell with the SuperKey):
 
 ```bash
 kpatch "$SUPERKEY" kpm ctl0 zn-auditpatch-kpm status
-# p1_hooked=1 target=logd p1_scanned=<n> p1_patched=<n> p1_errors=<n> | p2_hooked=1 p2_has_state=1 p2_gfp_atomic=0x480020 p2_patched=<n> p2_errors=<n>
+# p1_hooked=1 target=logd p1_scanned=<n> p1_patched=<n> p1_errors=<n> | p2_hooked=1 p2_has_state=1 p2_patched=<n> p2_errors=<n>
 kpatch "$SUPERKEY" kpm ctl0 zn-auditpatch-kpm reset   # zero the counters
 ```
 
@@ -262,51 +270,124 @@ case.
 
 ## Troubleshooting: "Embed" succeeds but the KPM never shows up as loaded
 
-**Fixed in v2.1.1 — was a real bug, not a config/usage issue, if you're on
-an earlier version.** Symptom: APatch Manager's "Embed KPM" step reports no
-error, but after flashing and rebooting the module never appears in
-APatch Manager's active-KPM list (as opposed to the "Existed/staged KPM"
-list, which just reflects what's embedded in boot.img, not what actually
-loaded), and there is no `zn-auditpatch-kpm: init, ...` line anywhere in
-`dmesg`.
+**If you're on v2.2.0+, both root causes below are already fixed — this
+section is kept as a record of what they were and how they were found,
+since the debugging technique (the `bootlog` trick especially) is useful
+for diagnosing *any* KPM that has this symptom, not just this one.**
 
-Root cause, confirmed by actually disassembling a real `aarch64` build of
-this module (not just syntax-checking it, which is all that's possible
-without a real cross toolchain — see the note in **Building** above): a
-real `aarch64` GCC, without `-fno-pic -fno-pie` set explicitly, emits
-`R_AARCH64_ADR_GOT_PAGE` / `R_AARCH64_LD64_GOT_LO12_NC` relocations for
-essentially every external/kfunc call in this file (`printk`, `kf_memcpy`,
-`kf_strcmp`, `kf_snprintf`, ... — almost everything). KernelPatch's own ELF
-relocator (`kernel/patch/module/relo.c`) does not implement either of those
-two relocation types; it logs `unsupported RELA relocation` and rejects
-the module outright. That rejection happens at **runtime, at boot**, not
-at embed time — "Embed" just copies the raw bytes into `boot.img`, it
-doesn't validate that KernelPatch's loader will actually accept them. That
-matches this symptom exactly: no error during Embed, module silently
-absent afterward, no init log because `.kpm.init` never got far enough to
-run.
+Symptom: APatch/FolkPatch Manager's "Embed KPM" step reports no error, but
+after flashing and rebooting the module never appears in the active-KPM
+list (as opposed to the "Existed/staged KPM" list, which just reflects
+what's embedded in `boot.img`, not what actually loaded), and
+`dmesg | grep -i kpm` shows nothing.
 
-The Makefile now sets `-fno-pic -fno-pie` and this was verified concretely
-(not just reasoned about): compiled with real `aarch64-linux-gnu-gcc`
-13.3.0 (the closest available stand-in for `aarch64-none-elf-gcc` in the
-environment this was fixed in), the object file went from containing
-`R_AARCH64_ADR_GOT_PAGE`/`R_AARCH64_LD64_GOT_LO12_NC` relocations on nearly
-every function call, to zero of them (174 relocations total, every single
-one from the small set `relo.c` explicitly handles), with `.kpm.info`,
-`.kpm.init`/`.kpm.ctl0`/`.kpm.exit`, and the symbol table all intact and
-correctly section-flagged. If you built an earlier version yourself,
-rebuilding with the current Makefile should be sufficient — no source
-changes were needed, only the compiler flags.
+**That last check is misleading, and finding that out was itself the key
+to diagnosing cause #2 below.** KernelPatch's own internal logging uses a
+`[+] KP I` / `[-] KP E` prefix, not the substring `kpm` — so a plain
+`grep -i kpm` on `dmesg` can miss the exact lines that matter. Worse, an
+*embedded* KPM is loaded by `kernel/patch/patch.c` at `pre-kernel-init`,
+early enough that the message may only exist in KernelPatch's own
+early-boot log buffer, not the regular kernel ring buffer `dmesg` reads at
+all. The reliable way to see it:
 
-If you rebuild and it *still* doesn't show up, the next things to check,
-in order of how directly they answer "did it load at all":
-1. `kpatch "$SUPERKEY" kpm list` right after a fresh reboot (most direct;
-   doesn't depend on dmesg not having rotated the relevant lines out yet).
-2. `dmesg | grep -iE "kpm|zn-auditpatch"` immediately after boot.
-3. `file auditpatch.kpm` should say `ELF 64-bit LSB relocatable, ARM
+```sh
+# no su needed -- this hijacks execve() of the literal `truncate` path
+/system/bin/truncate "$SUPERKEY" bootlog
+```
+and look for a line like:
+```
+KP load kpm: zn-auditpatch-kpm, event: pre-kernel-init, rc: -2
+```
+`rc` is a plain negative errno from KernelPatch's `load_module()` —
+`0` means it loaded, anything else tells you why it didn't (`-2` /
+`-ENOENT` specifically means "unknown symbol", see cause #2 below).
+
+### Cause 1: GOT-relative relocations (fixed in v2.1.1)
+
+Confirmed by actually disassembling a real `aarch64` build of this module
+(not just syntax-checking it, which is all `-fsyntax-only` can do — it
+never invokes an assembler): a real `aarch64` GCC, without
+`-fno-pic -fno-pie` set explicitly, emits `R_AARCH64_ADR_GOT_PAGE` /
+`R_AARCH64_LD64_GOT_LO12_NC` relocations for essentially every
+external/kfunc call in this file. KernelPatch's own ELF relocator
+(`kernel/patch/module/relo.c`) does not implement either relocation type;
+it logs `unsupported RELA relocation` and rejects the module. The Makefile
+now sets `-fno-pic -fno-pie`; verified concretely (compiled with real
+`aarch64-linux-gnu-gcc`, before/after: every function call using a GOT
+relocation → zero of them, all 174 relocations in the small set `relo.c`
+handles).
+
+### Cause 2: `kmalloc`/`kfree`/`kp_malloc`/`kp_free` not universally exported (fixed in v2.2.0)
+
+Fixing cause #1 was necessary but, on at least one real device, not
+sufficient — a `bootlog` capture (see above) from a genuine bug report
+showed the module still failing, with a *different* root cause:
+
+```
+KP E unknown symbol: kf_kfree
+KP E unknown symbol: tlsf_free
+KP E unknown symbol: kf___kmalloc
+KP E unknown symbol: tlsf_malloc
+KP E unknown symbol: kp_rw_mem
+KP E unknown symbol: kf_kmalloc
+KP load kpm: zn-auditpatch-kpm, event: pre-kernel-init, rc: -2
+```
+
+PART 2 used the real kernel's `kmalloc()`/`kfree()` (via KernelPatch's
+kfunc mechanism) to allocate a replacement context buffer, specifically
+*because* the buffer's eventual `kfree()` by unrelated kernel code
+requires it to come from a real, kfree()-compatible allocator (see the
+long comment above `after_sid_to_context()` in the source for the full
+reasoning — that part was correct). What turned out to be wrong was
+assuming that allocator path is universally present: on the device this
+was debugged against, `kf_kmalloc`/`kf___kmalloc`/`kf_kfree` were absent
+from that KernelPatch/FolkPatch build's exported symbol table entirely,
+which fails the *whole module's* load (symbol resolution happens for
+every undefined symbol before `KPM_INIT` ever runs).
+
+Less obviously: `kp_malloc()`/`kp_free()` — KernelPatch's *own* allocator,
+used by PART 1's scratch buffer at the time — turned out to depend on
+exactly the same unavailable symbols. They're `static inline` wrappers
+around `tlsf_malloc()`/`tlsf_free()`/`kp_rw_mem` (see KernelPatch's
+`kpmalloc.h`), which is why those three names show up in the same failure
+list even though nothing in this module calls them directly — the
+`kp_malloc`/`kp_free` symbol names themselves never appear in a compiled
+object at all, since they're inlined away, which is exactly why this
+half of the problem wasn't obvious from the undefined-symbol list alone.
+
+Both parts were rewritten to not depend on any kernel-object allocator:
+- PART 1's scratch buffer is now a fixed-size buffer on the stack (1536
+  bytes — comfortably covers real AVC audit lines, well inside a safe
+  stack budget, verified with `-fstack-usage`), never handed to any other
+  kernel code, so it needs no allocator at all.
+- PART 2 now overwrites the existing context buffer *in place* instead of
+  allocating a replacement, which is why its replacement text
+  (`CTX_REPLACEMENT_SHORT` in the source) is short and generic rather than
+  matching PART 1's fuller `u:r:priv_app:s0:c512,c768` — it's bounded by
+  the original buffer's exact size (a `kstrdup()`, confirmed against real
+  kernel source to have zero slack), not by a freely-sized allocation.
+
+If you rebuild with v2.2.0+, no allocator kfunc of any kind is required by
+this module anymore — only string/printk/hook-infrastructure kfuncs and
+KernelPatch's own core (`kver`, `task_struct_offset`, `hook_wrap`,
+`hook_syscalln`, `kallsyms_lookup_name`, ...), which is about as close to
+"every KernelPatch build has these" as this module can get.
+
+If you rebuild and it *still* doesn't show up, in order of how directly
+they answer "did it load at all":
+1. `/system/bin/truncate "$SUPERKEY" bootlog` right after a fresh reboot —
+   most direct, and (per above) catches cases regular `dmesg` misses.
+2. `kpatch "$SUPERKEY" kpm list`.
+3. `dmesg | grep -iE "KP [EWI]|kpm|zn-auditpatch"` — note the `KP [EWI]`
+   alternative, not just `kpm`, per the note above.
+4. `file auditpatch.kpm` should say `ELF 64-bit LSB relocatable, ARM
    aarch64`; if your build pipeline downloaded something else (an HTML
    error page saved with a `.kpm` extension, for instance), that's a
    packaging/download problem rather than anything about this module.
+5. If `bootlog` shows an `unknown symbol: X` line for something other than
+   an allocator symbol, that's a new instance of the same class of problem
+   as cause #2 — please report which symbol so this module can stop
+   depending on it too.
 
 ## Configuring the target process
 
@@ -360,11 +441,19 @@ actually compiling this to real AArch64 object code (see **Troubleshooting**
 above) and inspecting the result rather than just reasoning about it:
 
 - **Stack usage is small and checked in CI.** The largest function
-  (`auditpatch_control0`, which holds a 320-byte reply buffer) uses 448
-  bytes per `-fstack-usage`; everything else is well under 128 bytes. CI's
-  `fast-check` job fails the build if any function exceeds a 2 KiB budget,
-  as a guard against a future change accidentally adding a large local
-  buffer on top of an unknown, already-partially-used kernel stack.
+  (`after_recvfrom`, which holds the 1536-byte fixed scratch buffer
+  described in **Troubleshooting**) uses 1616 bytes per `-fstack-usage`;
+  everything else is well under 512 bytes. CI's `fast-check` job fails the
+  build if any function exceeds a 2 KiB budget, as a guard against a
+  future change accidentally growing that further on top of an unknown,
+  already-partially-used kernel stack.
+- **Neither part of this module allocates a kernel object anymore.** See
+  **Troubleshooting** for why: a real bug report showed that neither the
+  real kernel's `kmalloc()`/`kfree()` nor even this KPM's own
+  `kp_malloc()`/`kp_free()` are safe to assume present across KernelPatch
+  builds. PART 1's scratch buffer is a fixed-size stack buffer; PART 2
+  overwrites its target buffer in place. No allocator kfunc of any kind is
+  a load-time dependency of this module as of v2.2.0.
 - **Statistics counters are genuinely atomic**, not just `volatile`:
   `g_p1_scanned`/`g_p1_patched`/`g_p1_errors`/`g_p2_patched`/`g_p2_errors`
   are `atomic64_t`, confirmed by disassembly to compile to real
@@ -376,7 +465,12 @@ above) and inspecting the result rather than just reasoning about it:
 - **Every relocation type the build actually produces is one KernelPatch's
   loader implements**, enforced by `kpm/tools/verify-kpm.sh` in both CI
   jobs (see Troubleshooting) — not just "it compiled", which as v2.1.0
-  demonstrated is not sufficient on its own to mean it will load.
+  demonstrated is not sufficient on its own to mean it will load. That
+  script cannot, by its nature, catch a missing-*symbol* failure the way
+  it catches a bad relocation *type* (it has no way to know what symbols a
+  real target device's KernelPatch build does or doesn't export) — the
+  `bootlog` technique in Troubleshooting is the tool for that class of
+  problem instead.
 
 ## Credits / license
 
