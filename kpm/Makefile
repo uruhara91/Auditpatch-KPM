@@ -17,68 +17,23 @@ MODULE_NAME := auditpatch
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
-# -O2: matches upstream Linux kernel's own choice, not -O3/-Os. -O3's more
-#   aggressive inlining/vectorization is explicitly avoided by mainline
-#   kernel code, and -Os has a history of worse/buggier codegen on kernel
-#   code with some GCC versions; -O2 is the well-trodden path for this kind
-#   of freestanding, hook-heavy C.
-# -Wall -Wextra: catches real bugs at zero runtime cost (e.g. this project's
-#   Makefile/source caught a genuine `kver` parameter-shadows-global issue
-#   during review purely from -Wshadow; -Wextra is cheap insurance for the
-#   next change).
-# -fno-strict-aliasing: this module repeatedly reinterprets a raw uint64_t
-#   hook-argument slot as `char **`/`uint32_t *` (see after_sid_to_context
-#   in auditpatch.c) -- exactly the pattern strict-aliasing optimizations
-#   are allowed to miscompile. The kernel itself is built the same way for
-#   the same reason.
-# -fno-builtin: without this, GCC's builtin recognition of standard names
-#   (memcpy/strcmp/strncmp/...) can substitute its own expansion instead of
-#   actually calling KernelPatch's kfunc-backed implementations of those
-#   same names -- silently bypassing the indirection this environment
-#   relies on. Independently confirmed necessary by another real KPM
-#   project (Admirepowered/selinux_hook's Makefile disables the same
-#   builtins), not just a defensive guess here.
-# -fno-stack-protector: makes the "no stack-smashing checks in a freestanding
-#   KPM" assumption explicit rather than relying on the aarch64-none-elf
-#   toolchain's own default (which could differ across toolchain versions);
-#   the alternative is a __stack_chk_fail undefined-symbol failure at KPM
-#   load time.
-# -fno-common: standard kernel-module hygiene for global variable placement.
-#   Every global in this module already has an initializer, so this is a
-#   no-op today, but it's a cheap guard against a future uninitialized
-#   global becoming a tentative/COMMON symbol.
-# -fno-asynchronous-unwind-tables -fno-unwind-tables: drops .eh_frame /
-#   .eh_frame_hdr sections that have no meaning in a relocatable KPM object
-#   (nothing unwinds through kernel code this way) -- smaller .kpm, and one
-#   less category of section for the KPM loader to have to not care about.
-#
-# Deliberately NOT added, despite being tempting:
-# -O3 / -Os: see -O2 note above.
-# -ffreestanding: the upstream KernelPatch demo KPMs (kpms/demo-hello,
-#   kpms/demo-syscallhook) build without it, and adding it changes how GCC
-#   treats builtins in ways that weren't needed once -fno-builtin was
-#   already covering the actual concern (see above). Confirmed via a real
-#   aarch64-linux-gnu-gcc 13.3.0 build + disassembly that the current flag
-#   set alone already produces a clean relocation table (see the
-#   Troubleshooting section in README.md for the -fno-pic/-fno-pie story,
-#   which *was* verified this same way and *did* turn out to matter).
-# -fno-pic -fno-pie: CONFIRMED FIX, not a precaution. Verified empirically:
-#   without these, a real aarch64 GCC (13.3.0, tested via the Ubuntu
-#   aarch64-linux-gnu cross package as the closest available stand-in for
-#   aarch64-none-elf-gcc) emits R_AARCH64_ADR_GOT_PAGE / R_AARCH64_LD64_GOT_LO12_NC
-#   relocations for essentially every external/kfunc call in this file
-#   (printk, kf_memcpy, kf_strcmp, kf_snprintf, ...). KernelPatch's own
-#   relocator (kernel/patch/module/relo.c) does not implement either of
-#   those two relocation types -- it logs "unsupported RELA relocation"
-#   and rejects the module, which fails silently from the embedding side
-#   (the raw bytes get copied into boot.img fine; only the *runtime*
-#   loader at boot rejects it) and matches exactly a KPM that "embeds
-#   without error" but never appears in the active KPM list afterward.
-#   With these two flags, the same file produces zero GOT-relative
-#   relocations, only ones relo.c explicitly handles. This was very likely
-#   caused by the toolchain's own hardening-driven default behavior for
-#   external-symbol references rather than anything -fPIC-specific in the
-#   traditional sense, so it is set explicitly rather than assumed absent.
+# -O2: matches upstream Linux kernel's own choice (not -O3/-Os).
+# -Wall -Wextra: cheap insurance; caught a real kver shadowing bug via
+#   -Wshadow during review.
+# -fno-strict-aliasing: this module reinterprets a raw uint64_t hook-arg
+#   slot as char**/uint32_t* (see after_sid_to_context) -- exactly what
+#   strict-aliasing optimizations may miscompile. Kernel is built the same
+#   way for the same reason.
+# -fno-builtin: without it, GCC can substitute its own memcpy/strcmp/...
+#   instead of calling KernelPatch's kfunc-backed versions.
+# -fno-stack-protector: no stack-smashing checks in a freestanding KPM;
+#   otherwise risks a __stack_chk_fail undefined-symbol failure at load.
+# -fno-common: standard kernel-module hygiene for globals.
+# -fno-asynchronous-unwind-tables -fno-unwind-tables: drops .eh_frame
+#   sections meaningless in a relocatable KPM object.
+# -fno-pic -fno-pie: REQUIRED, not a precaution -- without these, real
+#   aarch64 GCC emits GOT-relative relocations KernelPatch's loader
+#   rejects at boot. See DEBUGGING.md Bug 1 for the full story.
 CFLAGS ?= -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -O2 \
           -fno-strict-aliasing -fno-builtin -fno-stack-protector -fno-common \
           -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-pic -fno-pie

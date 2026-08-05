@@ -1,15 +1,11 @@
 #!/bin/sh
 # Verify a built .kpm is actually loadable by KernelPatch, not just "an ELF
-# file that compiled". Checks the same things kernel/patch/module/module.c
-# checks before it will accept a module, plus the relocation-type
-# regression test for the real bug found (and fixed) in v2.1.0/v2.1.1: see
-# README.md's Troubleshooting section for the full story of how a KPM can
-# embed into boot.img without error and still silently fail to load at
-# boot.
+# file that compiled". Checks what kernel/patch/module/module.c checks
+# before accepting a module, plus a regression test for the relocation bug
+# fixed in v2.1.1 (see DEBUGGING.md Bug 1).
 #
 # Usage: verify-kpm.sh <readelf-binary> <path-to.kpm>
-# Exit 0 = all checks pass. Exit 1 = at least one check failed (message on
-# stderr explains which, and why it matters).
+# Exit 0 = all checks pass. Exit 1 = a check failed (stderr explains which).
 
 set -eu
 
@@ -42,12 +38,8 @@ if ! "$READELF" -S "$KPM" | grep -qi symtab; then
 fi
 echo "OK: .symtab present"
 
-# 3. Every relocation type used must be one relo.c actually implements.
-#    This is the regression test for the real bug found in v2.1.0: without
-#    -fno-pic -fno-pie, a real aarch64 GCC emits R_AARCH64_ADR_GOT_PAGE /
-#    R_AARCH64_LD64_GOT_LO12_NC for nearly every external/kfunc call, which
-#    KernelPatch's relocator does not handle and silently rejects the
-#    module at boot.
+# 3. Every relocation type used must be one relo.c actually implements
+#    (regression test for the v2.1.1 fix -- see DEBUGGING.md Bug 1).
 supported='R_AARCH64_NONE|R_AARCH64_ABS64|R_AARCH64_ABS32|R_AARCH64_ABS16|R_AARCH64_PREL64|R_AARCH64_PREL32|R_AARCH64_PREL16|R_AARCH64_MOVW_UABS_G0|R_AARCH64_MOVW_UABS_G1|R_AARCH64_MOVW_UABS_G2|R_AARCH64_MOVW_UABS_G3|R_AARCH64_MOVW_SABS_G0|R_AARCH64_MOVW_SABS_G1|R_AARCH64_MOVW_SABS_G2|R_AARCH64_MOVW_PREL_G0|R_AARCH64_MOVW_PREL_G1|R_AARCH64_MOVW_PREL_G2|R_AARCH64_MOVW_PREL_G3|R_AARCH64_LD_PREL_LO19|R_AARCH64_ADR_PREL_LO21|R_AARCH64_ADR_PREL_PG_HI21|R_AARCH64_ADD_ABS_LO12_NC|R_AARCH64_LDST8_ABS_LO12_NC|R_AARCH64_LDST16_ABS_LO12_NC|R_AARCH64_LDST32_ABS_LO12_NC|R_AARCH64_LDST64_ABS_LO12_NC|R_AARCH64_LDST128_ABS_LO12_NC|R_AARCH64_TSTBR14|R_AARCH64_CONDBR19|R_AARCH64_JUMP26|R_AARCH64_CALL26'
 used=$("$READELF" -r -W "$KPM" | grep -oE 'R_AARCH64_[A-Z0-9_]+' | sort -u)
 bad=""
@@ -58,8 +50,8 @@ for t in $used; do
 done
 if [ -n "$bad" ]; then
     echo "FAIL: relocation type(s) not handled by KernelPatch's relo.c:$bad" >&2
-    echo "This will build and 'Embed' without error, but the KPM will silently" >&2
-    echo "fail to load at boot. See README.md's Troubleshooting section." >&2
+    echo "This will build and 'Embed' without error, but silently fail to load" >&2
+    echo "at boot. See DEBUGGING.md." >&2
     exit 1
 fi
 echo "OK: all relocation types are ones relo.c handles ($(echo "$used" | wc -w) types used)"

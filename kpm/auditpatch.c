@@ -1,129 +1,56 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * zn-auditpatch-kpm
+ * auditpatch-kpm
  *
  * KernelPatch Module (KPM) port of the "ZN-AuditPatch" Zygisk Next module
  * (https://github.com/aviraxp/ZN-AuditPatch, see also
- * https://android-review.googlesource.com/c/platform/system/logging/+/3725346),
- * plus an optional deeper hook (see PART 2 below) that goes further than the
- * original module ever did.
+ * https://android-review.googlesource.com/c/platform/system/logging/+/3725346).
+ * Full design rationale and bug history: see README.md and DEBUGGING.md.
  *
- * ===========================================================================
- * PART 1: the logd/recvfrom hook (always active, works on any kernel)
- * ===========================================================================
- * The original module was injected (via Zygisk Next) into the `logd` process
- * and PLT-hooked `vasprintf()`. Whenever logd formatted an SELinux AVC audit
- * denial line whose `tcontext=` field named the `su` or `magisk` domain, it
- * rewrote that field to look like an ordinary `priv_app` context before the
- * line reached logcat.
+ * PART 1 (always active): hooks recvfrom() system-wide. logd receives every
+ * raw AVC denial line via recvfrom() on a netlink socket before its own
+ * vasprintf() formats it -- so this hooks recvfrom()'s *after* callback,
+ * filters by caller comm ("logd" by default), and rewrites a matched
+ * `tcontext=su/magisk` pattern in place (same anti-spoof quote-escape
+ * heuristic as upstream, see has_quote_after()). Uses a fixed-size stack
+ * scratch buffer, never a kernel allocator -- see DEBUGGING.md Bug 2 for
+ * why that matters.
  *
- * A KPM runs in kernel space, not injected into a specific userspace
- * process, so there is no `vasprintf()` inside our address space to hook.
- * Tracing the actual data path (system/logging/logd/libaudit.cpp +
- * LogAudit.cpp in AOSP) shows logd receives every raw kernel AVC denial
- * line -- already containing the literal text `tcontext=u:r:su:s0`, verbatim
- * -- via `recvfrom()` on a netlink socket, *before* its own vasprintf() ever
- * runs. So this module hooks `recvfrom` system-wide and, purely in the
- * "after" callback (i.e. after the real syscall already ran):
+ * PART 1b (v2.4.0+): same technique applied to plain read(), since some
+ * ROM/vendor logd forks read the audit socket that way. Unlike recvfrom(),
+ * read() isn't inherently socket-scoped, so this can't cheaply confirm the
+ * fd is really the audit socket -- see after_read() below.
  *
- *   - Bails out unless the calling task's comm is "logd" (or a custom name
- *     supplied via KPM load args).
- *   - Bails out unless the received text contains a target `tcontext=`
- *     pattern.
- *   - Rewrites it in a scratch kernel buffer (same quote-escape heuristic as
- *     upstream, see has_quote_after()), copies the result back over the
- *     caller's own buffer via compat_copy_to_user(), and patches the
- *     syscall's return value (byte count) to match.
+ * PART 2 (optional, version-gated): PART 1/1b only rewrite logd's
+ * formatted log line. Every other SID->string lookup (e.g.
+ * /proc/[pid]/attr/current) goes through security_sid_to_context() in
+ * security/selinux/ss/services.c; hooking that directly covers all of
+ * them, system-wide -- strictly broader than PART 1, since it can't
+ * distinguish "su/magisk is the denial target" from "su/magisk is the
+ * source" or plain introspection.
  *
- * This only ever touches a *userspace* buffer through the safe, documented
- * compat_copy_to_user()/compat_strncpy_from_user() primitives, and its own
- * scratch copy is a fixed-size buffer on the stack (see SCRATCH_BUF_SIZE) --
- * not a kernel allocator of any kind. It never allocates a kernel object
- * that other kernel code later frees, so it has no allocator-ownership
- * concerns and needs no kernel-version-specific tuning. It is always
- * installed, on every kernel KernelPatch itself runs on.
+ * security_sid_to_context()'s C signature has changed twice in kernel
+ * history (3-arg / 4-arg-with-state / 3-arg again). This hook only
+ * installs when the running kernel matches a verified entry in
+ * SID2CTX_ABI_TABLE (patch_logic.h) -- see DEBUGGING.md for exactly which
+ * kernel branches each entry was checked against. No match -> hook stays
+ * disabled, PART 1/1b unaffected.
  *
- * ===========================================================================
- * PART 2: the deep security_sid_to_context hook (version-gated, best-effort)
- * ===========================================================================
- * PART 1 only ever rewrites the `tcontext=` field inside logd's audit-log
- * text. It says nothing about `scontext=`, and it says nothing about any
- * *other* consumer of a SID->string context lookup, such as:
- *   - /proc/[pid]/attr/current and friends (what `id -Z`, getcon()-style
- *     APIs, and some root-detection SDKs read directly)
- *   - any other kernel code path that turns su/magisk's SID into a display
- *     string
+ * Neither PART 1/1b nor PART 2 allocate a kernel object: PART 1/1b use a
+ * stack-local scratch buffer, and PART 2 overwrites the existing context
+ * buffer in place (hence CTX_REPLACEMENT_SHORT being short/generic rather
+ * than PART 1's fuller replacement). See DEBUGGING.md Bug 2 for the real
+ * load failure that drove this.
  *
- * All of those ultimately go through one real kernel function:
- * `security_sid_to_context()` in security/selinux/ss/services.c. Hooking
- * *that* instead of (or alongside) recvfrom() covers all of the above at
- * once, which is what was asked for. It is a fundamentally more invasive
- * hook than PART 1, for two concrete reasons, both handled explicitly below
- * rather than glossed over:
+ * Configuring extra SELinux domains beyond the builtin su/magisk pair:
+ * see parse_args() below and struct extra_domain in patch_logic.h for the
+ * safety invariant it depends on (type name >= 2 chars, or PART 2's
+ * in-place overwrite could overflow -- checked at parse time and again at
+ * the write site in after_sid_to_context()).
  *
- * 1. ABI shape. security_sid_to_context()'s C signature has changed twice
- *    in kernel history:
- *      < 4.19        : security_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)
- *      4.19 to 6.3    : security_sid_to_context(struct selinux_state *state, u32 sid, char **scontext, u32 *scontext_len)
- *      6.4 and newer  : back to the 3-argument form
- *    Verified directly against real kernel source for this project: mainline
- *    tags v4.4/v4.9 (3-arg), v4.19/v5.4/v5.10/v5.15/v6.1 (4-arg),
- *    v6.2..v6.3 (4-arg), v6.4/v6.6/v6.12 (3-arg again) -- and cross-checked
- *    against the actual Android common-kernel branches android-4.19-stable,
- *    android-5.4-stable, android12-5.10, android13-5.15, android14-6.1 and
- *    android15-6.6, which all matched their mainline-version expectation.
- *
- * 2. Object lifetime and allocator availability. The buffer `*scontext`
- *    points to is a real kernel object that the *caller* eventually
- *    frees (verified directly in security/selinux/avc.c's
- *    avc_audit_post_callback and fs/proc/base.c's proc_pid_attr_read,
- *    both of which kfree() it after use, and in
- *    security/selinux/ss/services.c's context_struct_to_string, which
- *    allocates it with a plain kstrdup() -- exactly strlen()+1 bytes, no
- *    slack). This module used to swap in a freshly kmalloc()'d
- *    replacement buffer here, reasoning that this KPM's own kp_malloc()
- *    allocator (used in PART 1's scratch buffer at the time) would hand
- *    the kernel's real kfree() a pointer it never allocated. That
- *    reasoning about kfree() compatibility was correct, but it turned out
- *    to rest on a wrong assumption in the other direction: on the device
- *    this was actually debugged against, a bug report's boot log showed
- *    the *entire module* failing to load ("unknown symbol", rc=-2 /
- *    -ENOENT from KernelPatch's own kernel/patch/module/module.c) because
- *    kf_kmalloc, kf___kmalloc, kf_kfree, tlsf_malloc, tlsf_free, and
- *    kp_rw_mem were *all* absent from that build's exported symbol table
- *    -- not just the real kernel's kmalloc()/kfree(), but also
- *    kp_malloc()/kp_free() themselves, since kpmalloc.h's kp_malloc() and
- *    kp_free() are `static inline` wrappers around exactly
- *    tlsf_malloc()/tlsf_free()/kp_rw_mem. Neither allocator was actually
- *    reliably present; only one of the two failures was visible at first
- *    because the other was hidden behind inlining. In other words: no
- *    kernel-object allocator this module could call -- KernelPatch's own
- *    or the real kernel's -- is a safe assumption to depend on across
- *    KernelPatch builds.
- *
- *    So neither part of this module allocates kernel objects anymore.
- *    PART 2 overwrites the existing context buffer *in place*, which
- *    means the replacement text can never be longer than the shortest
- *    pattern it might replace (see CTX_REPLACEMENT_SHORT below) -- a real
- *    cosmetic downgrade from a freely-sized replacement, accepted
- *    deliberately in exchange for the module actually loading. PART 1
- *    (see after_recvfrom) switched its scratch buffer from kp_malloc() to
- *    a fixed-size buffer on the stack, which needs no allocator symbol at
- *    all since it never leaves the function or outlives the call.
- *
- * Kernel-version ABI shape is still tracked in SID2CTX_ABI_TABLE below
- * (only has_state_arg now, since there's no GFP flag to get right anymore
- * -- see git history if you want the version that needed one). On a
- * kernel version that matches a table entry, the deep hook installs. On
- * anything else, it does not -- it is left disabled rather than guessed
- * at, and PART 1 (recvfrom/logd) keeps working regardless.
- *
- * Unlike PART 1, the deep hook cannot distinguish "su/magisk is the target
- * of a denial" from "su/magisk is the source" (or, for that matter, from
- * plain context introspection with no denial involved at all) -- it patches
- * *every* successful resolution of the su/magisk domain SID to a string,
- * system-wide. That is strictly broader than upstream ZN-AuditPatch's scope
- * and is the whole point of this part.
+ * Deliberately not implemented: recvmsg() coverage (a real API
+ * constraint) and a general printk()-wide hook (out of scope by design).
+ * See DEBUGGING.md for the reasoning.
  */
 
 #include <compiler.h>
@@ -141,77 +68,51 @@
 #include <kputils.h>
 #include <asm/current.h>
 
-KPM_NAME("zn-auditpatch-kpm");
-KPM_VERSION("2.2.0");
+/* Pure string/ABI-table logic lives in patch_logic.h, shared verbatim with
+ * tests/test_logic.c's host-side unit tests -- see that header for why.
+ * Included after the kernel headers above so its VERSION()/strnstr()
+ * fallback guards see those definitions already in scope. */
+#include "patch_logic.h"
+
+KPM_NAME("auditpatch-kpm");
+KPM_VERSION("2.4.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("aviraxp; KP port");
+KPM_AUTHOR("aviraxp, uruhara91");
 KPM_DESCRIPTION("Hide su/magisk context from AVC audit logs (+ optional deep SELinux hook)");
 
 /* ------------------------------------------------------------------------
  * Shared constants
- * ------------------------------------------------------------------------ */
+ * ------------------------------------------------------------------------
+ * CTX_SU/CTX_MAGISK/CTX_REPLACEMENT/CTX_REPLACEMENT_SHORT, the PATTERN_*
+ * strings built from them, MAX_EXTRA_DOMAINS and struct extra_domain all
+ * now live in patch_logic.h (shared verbatim with the host unit tests) --
+ * see that header. Only what stays genuinely kernel/module-specific
+ * remains here. */
 
-/* Default target process for PART 1, overridable at `kpm load` time via
- * KPM_ARGS (see auditpatch_init). */
+/* Default target process for PART 1/1b, overridable at `kpm load` time via
+ * KPM_ARGS (see parse_args). */
 #define DEFAULT_TARGET_COMM "logd"
 
-/* Raw context values we're looking for, and what we replace them with.
- * These are the values as security_sid_to_context() itself returns them
- * (no "tcontext=" prefix -- that's a PART 1/text-log-line-only concept). */
-#define CTX_SU "u:r:su:s0"
-#define CTX_MAGISK "u:r:magisk:s0"
-#define CTX_REPLACEMENT "u:r:priv_app:s0:c512,c768"
-#define CTX_REPLACEMENT_LEN (sizeof(CTX_REPLACEMENT) - 1)
-
-/* PART 2 (see after_sid_to_context) can only ever overwrite the existing
- * context buffer *in place* -- see the long comment above PART 2 for why
- * it cannot allocate a replacement the way PART 1 does. That means its
- * replacement must never be longer than the shortest pattern it might
- * replace (CTX_SU, 9 bytes), since context_struct_to_string() allocates
- * exactly strlen(original)+1 bytes with zero slack (confirmed against
- * real kernel source: it's a plain kstrdup()). Deliberately short and
- * generic rather than a closer copy of CTX_REPLACEMENT above -- being
- * unable to grow the buffer is the binding constraint here, not stylistic
- * preference.
- */
-#define CTX_REPLACEMENT_SHORT "u:r:na:s0"
-#define CTX_REPLACEMENT_SHORT_LEN (sizeof(CTX_REPLACEMENT_SHORT) - 1)
-
-/* PART 1 matches inside a formatted log line, so it needs the "tcontext="
- * prefix glued on (plain C string literal concatenation). Only tcontext=,
- * never scontext=, exactly like upstream ZN-AuditPatch. */
-static const char PATTERN_SU[] = "tcontext=" CTX_SU;
-static const char PATTERN_MAGISK[] = "tcontext=" CTX_MAGISK;
-static const char PATTERN_REPLACEMENT[] = "tcontext=" CTX_REPLACEMENT;
-
-#define PATTERN_SU_LEN (sizeof(PATTERN_SU) - 1)
-#define PATTERN_MAGISK_LEN (sizeof(PATTERN_MAGISK) - 1)
-#define PATTERN_REPLACEMENT_LEN (sizeof(PATTERN_REPLACEMENT) - 1)
-
-/* sizeof() is a compiler construct, not something the preprocessor can
- * evaluate in #if, so this constraint is enforced with a real compile-time
- * assertion instead of #if/#error. */
-_Static_assert(CTX_REPLACEMENT_SHORT_LEN <= (sizeof(CTX_SU) - 1),
-                "CTX_REPLACEMENT_SHORT must never be longer than CTX_SU (see comment above)");
-
-/* PART 1's scratch copy is a fixed-size buffer *on the stack*, not a
- * kp_malloc()/kp_free() allocation -- see the long comment above
- * after_recvfrom() for why kp_malloc()/kp_free() (backed by
- * tlsf_malloc()/tlsf_free()/kp_rw_mem under the hood) turned out not to be
- * a safe assumption either. 1536 bytes comfortably covers real AVC audit
- * lines (a few hundred bytes in practice; MAX_AUDIT_MESSAGE_LENGTH in AOSP
- * libaudit.h is 8970 as a theoretical ceiling, but a hook running on top
- * of an unknown, already-partially-used kernel stack has no business
- * reserving anything close to that) while staying well inside the
- * fast-check CI job's stack-usage budget for this function. A read that
- * doesn't fit is simply left unpatched rather than truncated or
- * overflowed -- see the size check in after_recvfrom(). */
+/* PART 1/1b's scratch copy is a fixed-size buffer *on the stack*, not a
+ * kp_malloc()/kp_free() allocation -- see DEBUGGING.md Bug 2. 1536 bytes
+ * comfortably covers real AVC audit lines (a few hundred bytes in
+ * practice; AOSP's MAX_AUDIT_MESSAGE_LENGTH is 8970 as a theoretical
+ * ceiling, but a hook running on an unknown, already-partially-used
+ * kernel stack shouldn't reserve anywhere near that) while staying well
+ * inside the CI stack-usage budget. A read that doesn't fit is left
+ * unpatched rather than truncated -- see the size check in
+ * after_recvfrom()/after_read(). */
 #define SCRATCH_BUF_SIZE 1536
 
 /* The largest a match can possibly grow by: PATTERN_REPLACEMENT_LEN minus
- * the shortest pattern we match against (PATTERN_SU). Used to make sure
- * there's room left in SCRATCH_BUF_SIZE for growth, not just the raw
- * bytes read. */
+ * the shortest *builtin* pattern we match against (PATTERN_SU). Extra
+ * domains configured via args can only ever produce a pattern >= that
+ * length too (MIN_EXTRA_DOMAIN_TYPE_LEN in patch_logic.h guarantees it),
+ * so PATTERN_SU remains a valid worst-case baseline for this early-return
+ * headroom check even with extra domains in play. Note this check is a
+ * "don't bother trying" optimization, not the actual safety net -- see
+ * try_patch_one()'s own `new_len > cap` check in patch_logic.h, which is
+ * what really bounds every write regardless of which pattern is used. */
 #define MAX_GROWTH (PATTERN_REPLACEMENT_LEN - PATTERN_SU_LEN)
 #define ALLOC_HEADROOM (MAX_GROWTH + 16)
 
@@ -221,9 +122,16 @@ _Static_assert(CTX_REPLACEMENT_SHORT_LEN <= (sizeof(CTX_SU) - 1),
 
 static char g_target_comm[TASK_COMM_LEN] = DEFAULT_TARGET_COMM;
 
+/* Extra SELinux domains configured via KPM args, beyond the builtin
+ * su/magisk pair -- see parse_args(). Set once at init, never mutated
+ * afterward, so concurrent hook callbacks on other CPUs can read it
+ * lock-free (same reasoning as g_target_comm below). */
+static struct extra_domain g_extra_domains[MAX_EXTRA_DOMAINS];
+static int g_extra_domain_count = 0;
+
 /* Plain counters incremented from a hook can run on any CPU concurrently
- * (recvfrom()/security_sid_to_context() are not serialized against each
- * other across cores), so these are atomic64_t rather than a bare
+ * (recvfrom()/read()/security_sid_to_context() are not serialized against
+ * each other across cores), so these are atomic64_t rather than a bare
  * volatile uint64_t -- purely so the stats reported by ctl0 can't lose
  * updates under concurrent access. Nothing security-relevant depends on
  * these; only the reporting does. */
@@ -232,6 +140,14 @@ static atomic64_t g_p1_patched = ATOMIC64_INIT(0);
 static atomic64_t g_p1_errors = ATOMIC64_INIT(0);
 static int g_p1_hooked = 0;
 
+/* PART 1b: same technique as PART 1, applied to plain read() as well as
+ * recvfrom() -- see the comment above after_read() for what this does and
+ * does not cover. */
+static atomic64_t g_p1b_scanned = ATOMIC64_INIT(0);
+static atomic64_t g_p1b_patched = ATOMIC64_INIT(0);
+static atomic64_t g_p1b_errors = ATOMIC64_INIT(0);
+static int g_p1b_hooked = 0;
+
 static atomic64_t g_p2_patched = ATOMIC64_INIT(0);
 static atomic64_t g_p2_errors = ATOMIC64_INIT(0);
 static int g_p2_hooked = 0;
@@ -239,79 +155,112 @@ static int g_p2_has_state_arg = 0;
 static uint64_t g_p2_addr = 0;
 
 /* ==========================================================================
+ * Args parsing: target comm + extra domains
+ * ========================================================================== */
+
+/*
+ * KPM args format: "<target_comm>[,<extra_type>[,<extra_type>...]]"
+ *   - First segment overrides g_target_comm, exactly as before (backward
+ *     compatible with every existing `kpm load ... "somecomm"` invocation --
+ *     a bare comm with no comma behaves identically to the old code).
+ *   - Each remaining comma-separated segment is a bare SELinux *type* name
+ *     (e.g. "ksu") for a custom su implementation. This module builds
+ *     "u:r:<type>:s0" from it and treats it exactly like CTX_SU/CTX_MAGISK
+ *     in both PART 1/1b (text pattern) and PART 2 (direct context match).
+ *     See MIN_EXTRA_DOMAIN_TYPE_LEN in patch_logic.h for why a 1-character
+ *     type is rejected outright rather than merely discouraged.
+ *
+ * No allocation: everything here writes into the fixed g_extra_domains[]
+ * array (MAX_EXTRA_DOMAINS entries), same "no kernel allocator" reasoning
+ * as PART 1/2's scratch buffers -- see the long comment near the top of
+ * this file.
+ */
+static void parse_args(const char *args)
+{
+    const char *p = args;
+    const char *comma;
+    size_t seg_len;
+
+    if (!args || args[0] == '\0') {
+        pr_info("auditpatch-kpm: [args] target comm defaults to '%s', no extra domains\n", g_target_comm);
+        return;
+    }
+
+    comma = strchr(p, ',');
+    seg_len = comma ? (size_t)(comma - p) : strlen(p);
+    if (seg_len > 0) {
+        if (seg_len > TASK_COMM_LEN - 1) seg_len = TASK_COMM_LEN - 1;
+        memcpy(g_target_comm, p, seg_len);
+        g_target_comm[seg_len] = '\0';
+        pr_info("auditpatch-kpm: [args] target comm overridden to '%s'\n", g_target_comm);
+    }
+
+    if (!comma) return;
+    p = comma + 1;
+
+    while (*p && g_extra_domain_count < MAX_EXTRA_DOMAINS) {
+        struct extra_domain *d;
+
+        comma = strchr(p, ',');
+        seg_len = comma ? (size_t)(comma - p) : strlen(p);
+
+        if (!extra_domain_type_len_ok(seg_len)) {
+            pr_warn(
+                "auditpatch-kpm: [args] skipping extra domain token of invalid length "
+                "(%zu, need %d..%d), '%s' unaffected\n",
+                seg_len, MIN_EXTRA_DOMAIN_TYPE_LEN, MAX_EXTRA_DOMAIN_TYPE_LEN, g_target_comm);
+        } else {
+            d = &g_extra_domains[g_extra_domain_count];
+            memcpy(d->type, p, seg_len);
+            d->type[seg_len] = '\0';
+            d->raw_ctx_len = snprintf(d->raw_ctx, sizeof(d->raw_ctx), "u:r:%s:s0", d->type);
+            d->pattern_len = snprintf(d->pattern, sizeof(d->pattern), "tcontext=u:r:%s:s0", d->type);
+            pr_info("auditpatch-kpm: [args] extra domain #%d: type='%s' raw='%s'\n", g_extra_domain_count,
+                    d->type, d->raw_ctx);
+            g_extra_domain_count++;
+        }
+
+        if (!comma) break;
+        p = comma + 1;
+    }
+
+    if (*p && g_extra_domain_count >= MAX_EXTRA_DOMAINS) {
+        pr_warn("auditpatch-kpm: [args] extra domain list truncated at %d entries (MAX_EXTRA_DOMAINS)\n",
+                MAX_EXTRA_DOMAINS);
+    }
+}
+
+/* ==========================================================================
  * PART 1: logd / recvfrom hook
  * ========================================================================== */
 
 /*
- * Mirrors the original module's has_quote_after(): if a `"` appears
- * anywhere after the matched pattern (within the bytes we actually have),
- * treat the match as unsafe/spoofable (e.g. embedded inside a quoted
- * name="..." field) and refuse to touch it.
+ * Try every configured pattern (builtin su/magisk, then any extra domains
+ * from parse_args) against one buffer, stopping at the first match. Shared
+ * between after_recvfrom() and after_read() so the two hooks can never
+ * drift out of sync on which patterns they look for.
  */
-static int has_quote_after(const char *buf, int total_len, int from)
+static int try_patch_any(char *buf, int *len, int cap)
 {
     int i;
-    for (i = from; i < total_len; i++) {
-        if (buf[i] == '"') return 1;
+
+    if (try_patch_one(buf, len, cap, PATTERN_SU, (int)PATTERN_SU_LEN)) return 1;
+    if (try_patch_one(buf, len, cap, PATTERN_MAGISK, (int)PATTERN_MAGISK_LEN)) return 1;
+
+    for (i = 0; i < g_extra_domain_count; i++) {
+        if (try_patch_one(buf, len, cap, g_extra_domains[i].pattern, g_extra_domains[i].pattern_len)) return 1;
     }
     return 0;
-}
-
-/*
- * Attempt a single in-place substitution of `pattern` -> PATTERN_REPLACEMENT
- * inside buf[0..*len). `cap` is the hard upper bound (the real userspace
- * buffer capacity) that the result must never exceed. Returns 1 if a
- * replacement was made (and updates *len), 0 otherwise.
- */
-static int try_patch_one(char *buf, int *len, int cap, const char *pattern, int pattern_len)
-{
-    char *pos;
-    int match_off, tail_len, new_len;
-
-    if (*len < pattern_len) return 0;
-
-    pos = strnstr(buf, pattern, *len);
-    if (!pos) return 0;
-
-    match_off = (int)(pos - buf);
-
-    if (has_quote_after(buf, *len, match_off + pattern_len)) return 0;
-
-    tail_len = *len - (match_off + pattern_len);
-    new_len = match_off + (int)PATTERN_REPLACEMENT_LEN + tail_len;
-
-    if (new_len > cap) {
-        pr_warn("zn-auditpatch-kpm: [p1] replacement would exceed buffer capacity (cap=%d need=%d), skipped\n", cap,
-                new_len);
-        return 0;
-    }
-
-    if (tail_len > 0) {
-        memmove(buf + match_off + PATTERN_REPLACEMENT_LEN, buf + match_off + pattern_len, tail_len);
-    }
-    memcpy(buf + match_off, PATTERN_REPLACEMENT, PATTERN_REPLACEMENT_LEN);
-
-    *len = new_len;
-    return 1;
 }
 
 /*
  * after-hook on recvfrom(int sockfd, void *buf, size_t len, int flags,
  *                        struct sockaddr *src_addr, socklen_t *addrlen)
  *
- * Uses a fixed-size on-stack scratch buffer, not kp_malloc()/kp_free().
- * That switch (from an earlier version of this module that did use
- * kp_malloc()/kp_free()) exists for the same reason PART 2 no longer
- * allocates at all: kp_malloc()/kp_free() are static inline wrappers
- * around tlsf_malloc()/tlsf_free()/kp_rw_mem (see kpmalloc.h), and those
- * turned out to be exactly the symbols missing from the KernelPatch build
- * this was actually debugged against -- "unknown symbol: tlsf_malloc" /
- * "tlsf_free" / "kp_rw_mem", right alongside the kmalloc()/kfree() ones,
- * in the same failed load. A scratch buffer that's purely local to this
- * function -- never handed to any other kernel code, never outliving this
- * call -- has no reason to go through a kernel allocator of any kind in
- * the first place; a fixed-size local array sidesteps the whole class of
- * problem.
+ * Uses a fixed-size on-stack scratch buffer, not kp_malloc()/kp_free() --
+ * a scratch buffer purely local to this function, never handed to other
+ * kernel code, has no reason to go through a kernel allocator at all. See
+ * DEBUGGING.md Bug 2 for the real load failure that motivated this.
  */
 static void after_recvfrom(hook_fargs6_t *args, void *udata)
 {
@@ -359,21 +308,105 @@ static void after_recvfrom(hook_fargs6_t *args, void *udata)
     if (copied <= 0) return;
 
     len = (int)copied;
-
-    patched = try_patch_one(scratch, &len, user_cap, PATTERN_SU, (int)PATTERN_SU_LEN);
-    if (!patched) {
-        patched = try_patch_one(scratch, &len, user_cap, PATTERN_MAGISK, (int)PATTERN_MAGISK_LEN);
-    }
+    patched = try_patch_any(scratch, &len, user_cap);
 
     if (patched) {
         if (compat_copy_to_user(ubuf, scratch, len) == 0) {
             args->ret = (uint64_t)len;
             atomic64_inc(&g_p1_patched);
-            pr_info("zn-auditpatch-kpm: [p1] patched avc audit tcontext in '%s' (total: %lld)\n", comm,
+            pr_info("auditpatch-kpm: [p1] patched avc audit tcontext in '%s' (total: %lld)\n", comm,
                     (long long)atomic64_read(&g_p1_patched));
         } else {
             atomic64_inc(&g_p1_errors);
-            pr_err("zn-auditpatch-kpm: [p1] compat_copy_to_user failed\n");
+            pr_err("auditpatch-kpm: [p1] compat_copy_to_user failed\n");
+        }
+    }
+}
+
+/* ==========================================================================
+ * PART 1b: read() hook -- same technique, a different (and riskier) syscall
+ * ========================================================================== */
+
+/*
+ * after-hook on read(int fd, void *buf, size_t count).
+ *
+ * Some ROM/vendor logd forks read the netlink audit socket with plain
+ * read() instead of recvfrom() (recvfrom() with a NULL src_addr is
+ * functionally just read() on a connected/bound socket). Its (buf, count)
+ * argument shape maps onto syscall_argn(args, {1,2}) the exact same way
+ * recvfrom's does, and the payload is the same NUL-terminated AVC text, so
+ * this reuses try_patch_any()/the same scratch-buffer discipline verbatim
+ * -- no new allocation, no new buffer-safety story to get right.
+ *
+ * What IS genuinely different from PART 1, and does not have a clean
+ * answer: recvfrom() is a socket-only syscall, so hooking it is inherently
+ * already scoped to socket I/O. read() is not -- it's used on regular
+ * files, pipes, and anything else with a file descriptor. This hook has no
+ * cheap way to confirm `fd` is actually the netlink audit socket before
+ * touching the buffer; it relies entirely on the existing g_target_comm
+ * filter (default "logd") plus the pattern match itself (an unrelated
+ * file would need to contain the literal byte sequence
+ * "tcontext=u:r:su:s0" at the exact offset read() returned to be touched
+ * at all) to keep the blast radius narrow. Verifying the fd is really a
+ * NETLINK_AUDIT socket would need fdget()/sock_from_file()-style
+ * kernel-internal calls resolved via kallsyms, with their own
+ * version-specific ABI risk -- the same kind of complexity PART 2 already
+ * carries for one function. Left as a known, explicitly-stated gap rather
+ * than adding that complexity silently; see README.
+ */
+static void after_read(hook_fargs3_t *args, void *udata)
+{
+    long ret;
+    uint64_t buf_arg, cap_arg;
+    void __user *ubuf;
+    int user_cap;
+    long copied;
+    int len;
+    int patched;
+    char scratch[SCRATCH_BUF_SIZE];
+    struct task_struct *task;
+    const char *comm;
+
+    ret = (long)args->ret;
+    if (ret <= 0) return;
+
+    task = current;
+    if (!task) return;
+    comm = get_task_comm(task);
+    if (!comm) return;
+    if (strncmp(comm, g_target_comm, TASK_COMM_LEN)) return;
+
+    buf_arg = syscall_argn(args, 1);
+    if (!buf_arg) return;
+    ubuf = (void __user *)buf_arg;
+
+    cap_arg = syscall_argn(args, 2);
+    if (cap_arg == 0 || cap_arg > (uint64_t)(SCRATCH_BUF_SIZE - 1)) {
+        user_cap = SCRATCH_BUF_SIZE - 1;
+    } else {
+        user_cap = (int)cap_arg;
+    }
+    if (ret > user_cap) ret = user_cap;
+
+    if (ret + ALLOC_HEADROOM > (int)sizeof(scratch)) return;
+
+    atomic64_inc(&g_p1b_scanned);
+
+    copied = compat_strncpy_from_user(scratch, (const char __user *)ubuf, ret);
+    if (copied <= 0) return;
+
+    len = (int)copied;
+    patched = try_patch_any(scratch, &len, user_cap);
+
+    if (patched) {
+        if (compat_copy_to_user(ubuf, scratch, len) == 0) {
+            args->ret = (uint64_t)len;
+            atomic64_inc(&g_p1b_patched);
+            pr_info("auditpatch-kpm: [p1b] patched avc audit tcontext via read() in '%s' (total: %lld)\n", comm,
+                    (long long)atomic64_read(&g_p1b_patched));
+        } else {
+            atomic64_inc(&g_p1b_errors);
+            pr_err("auditpatch-kpm: [p1b] compat_copy_to_user failed\n");
         }
     }
 }
@@ -381,49 +414,19 @@ static void after_recvfrom(hook_fargs6_t *args, void *udata)
 /* ==========================================================================
  * PART 2: deep security_sid_to_context hook (version-gated)
  * ========================================================================== */
-
-struct sid2ctx_abi {
-    uint32_t kver_min; /* inclusive */
-    uint32_t kver_max; /* exclusive */
-    int has_state_arg; /* security_sid_to_context(state, sid, ...) vs (sid, ...) */
-    const char *note;
-};
-
-/*
- * Every row here was checked against real kernel source (both mainline
- * torvalds/linux release tags and the actual Android common-kernel
- * branches) before being added -- see the PART 2 comment above for exactly
- * which ones. Do not add a row "by pattern-matching" the ones around it;
- * verify it the same way first.
- */
-static const struct sid2ctx_abi SID2CTX_ABI_TABLE[] = {
-    /* android-4.19-stable and mainline v4.19 (covers e.g. 4.19.191) */
-    { VERSION(4, 19, 0), VERSION(5, 0, 0), 1, "4.19.x" },
-    /* android-5.4-stable, android12-5.10, android13-5.15, android14-6.1,
-     * and mainline v5.4/v5.10/v5.15/v6.1 */
-    { VERSION(5, 0, 0), VERSION(6, 4, 0), 1, "5.4.x-6.3.x" },
-    /* android15-6.6 and mainline v6.4/v6.6/v6.12 (state arg dropped again) */
-    { VERSION(6, 4, 0), VERSION(7, 0, 0), 0, "6.4.x+" },
-};
-
-#define SID2CTX_ABI_TABLE_LEN (sizeof(SID2CTX_ABI_TABLE) / sizeof(SID2CTX_ABI_TABLE[0]))
+/* struct sid2ctx_abi, SID2CTX_ABI_TABLE and sid2ctx_abi_lookup() now live in
+ * patch_logic.h (shared verbatim with the host unit tests) -- see that
+ * header for the table itself and the provenance note above it. */
 
 /*
  * after-hook on security_sid_to_context(), 4 argument slots captured
  * unconditionally (harmless to over-capture one unused register on the
  * 3-arg ABI -- see g_p2_has_state_arg branch below).
  *
- * Deliberately never allocates. Real kernel kmalloc()/kfree() are NOT a
- * safe default assumption across KernelPatch builds -- confirmed the hard
- * way: on the device this was debugged against, kmalloc()/kfree() (and
- * their underlying kf_kmalloc, kf___kmalloc, kf_kfree, tlsf_malloc,
- * tlsf_free, and kp_rw_mem symbols) were simply absent from that build's
- * exported symbol table, which made the *entire module* fail to load
- * ("unknown symbol", rc=-2 / -ENOENT from KernelPatch's own module.c)
- * even though every other symbol it needs (including kp_malloc/kp_free,
- * used by PART 1) resolved fine. So PART 2 only ever overwrites the
- * existing buffer in place -- see the CTX_REPLACEMENT_SHORT comment above
- * for why that bounds what the replacement can say.
+ * Deliberately never allocates -- real kernel kmalloc()/kfree() is not a
+ * safe default assumption across KernelPatch builds, see DEBUGGING.md Bug
+ * 2. So this only ever overwrites the existing buffer in place -- see the
+ * CTX_REPLACEMENT_SHORT comment above for why that bounds the replacement.
  */
 static void after_sid_to_context(hook_fargs4_t *args, void *udata)
 {
@@ -445,38 +448,47 @@ static void after_sid_to_context(hook_fargs4_t *args, void *udata)
     scontext = *scontext_ptr;
     if (!scontext) return;
 
-    if (strcmp(scontext, CTX_SU) && strcmp(scontext, CTX_MAGISK)) return;
+    if (strcmp(scontext, CTX_SU) && strcmp(scontext, CTX_MAGISK)) {
+        int i, matched = 0;
+        for (i = 0; i < g_extra_domain_count; i++) {
+            if (!strcmp(scontext, g_extra_domains[i].raw_ctx)) {
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched) return;
+    }
 
-    /* CTX_REPLACEMENT_SHORT_LEN <= strlen(CTX_SU) is enforced at compile
-     * time above, and CTX_SU is the shorter of the two patterns we match,
-     * so this write (including its NUL) always fits inside the buffer
-     * context_struct_to_string() originally kstrdup()'d -- confirmed
-     * against real kernel source that it allocates exactly
-     * strlen(original)+1 bytes, no slack. Same pointer, same allocation,
-     * untouched otherwise: whoever eventually kfree()s *scontext_ptr
-     * still frees exactly what security_sid_to_context() gave them. */
+    /* AUDITPATCH_TRUST_BUT_VERIFY: CTX_REPLACEMENT_SHORT_LEN <= every
+     * matchable context's length is *supposed* to already be guaranteed --
+     * at compile time for CTX_SU/CTX_MAGISK (_Static_assert in
+     * patch_logic.h), and at parse time for extra domains
+     * (extra_domain_type_len_ok() in parse_args()). But this is the one
+     * place that invariant actually matters: the next line overwrites a
+     * real kernel object in place, kstrdup()'d to exactly
+     * strlen(original)+1 bytes with zero slack. "Should be unreachable"
+     * is not good enough justification for skipping the check right next
+     * to the unsafe write it protects -- verify the actual buffer we're
+     * about to overwrite is long enough, not just trust that every caller
+     * upheld the invariant correctly. */
+    if (strlen(scontext) < CTX_REPLACEMENT_SHORT_LEN) {
+        atomic64_inc(&g_p2_errors);
+        pr_err(
+            "auditpatch-kpm: [p2] BUG: matched context '%s' (len=%zu) shorter than "
+            "replacement (len=%d), refusing to avoid buffer overflow\n",
+            scontext, strlen(scontext), (int)CTX_REPLACEMENT_SHORT_LEN);
+        return;
+    }
+
+    /* Same pointer, same allocation, untouched otherwise: whoever
+     * eventually kfree()s *scontext_ptr still frees exactly what
+     * security_sid_to_context() gave them. */
     memcpy(scontext, CTX_REPLACEMENT_SHORT, CTX_REPLACEMENT_SHORT_LEN + 1);
     *scontext_len_ptr = (uint32_t)CTX_REPLACEMENT_SHORT_LEN;
 
     atomic64_inc(&g_p2_patched);
-    pr_info("zn-auditpatch-kpm: [p2] patched sid->context result (total: %lld)\n",
+    pr_info("auditpatch-kpm: [p2] patched sid->context result (total: %lld)\n",
             (long long)atomic64_read(&g_p2_patched));
-}
-
-/* Returns 1 and fills *out if running_kver matches a verified table entry,
- * else 0. Takes the version as a parameter (rather than reading the global
- * `kver` directly) purely so this is trivially unit-testable/reviewable in
- * isolation. */
-static int sid2ctx_abi_lookup(uint32_t running_kver, const struct sid2ctx_abi **out)
-{
-    unsigned i;
-    for (i = 0; i < SID2CTX_ABI_TABLE_LEN; i++) {
-        if (running_kver >= SID2CTX_ABI_TABLE[i].kver_min && running_kver < SID2CTX_ABI_TABLE[i].kver_max) {
-            *out = &SID2CTX_ABI_TABLE[i];
-            return 1;
-        }
-    }
-    return 0;
 }
 
 static void install_deep_hook(void)
@@ -486,7 +498,7 @@ static void install_deep_hook(void)
 
     if (!sid2ctx_abi_lookup(kver, &abi)) {
         pr_warn(
-            "zn-auditpatch-kpm: [p2] kernel version 0x%x has no verified ABI "
+            "auditpatch-kpm: [p2] kernel version 0x%x has no verified ABI "
             "table entry, deep hook left DISABLED (part 1 / logd hook still active)\n",
             kver);
         return;
@@ -494,7 +506,7 @@ static void install_deep_hook(void)
 
     g_p2_addr = kallsyms_lookup_name("security_sid_to_context");
     if (!g_p2_addr) {
-        pr_warn("zn-auditpatch-kpm: [p2] security_sid_to_context not found via kallsyms, deep hook DISABLED\n");
+        pr_warn("auditpatch-kpm: [p2] security_sid_to_context not found via kallsyms, deep hook DISABLED\n");
         return;
     }
 
@@ -502,13 +514,13 @@ static void install_deep_hook(void)
 
     err = hook_wrap((void *)g_p2_addr, 4, NULL, after_sid_to_context, NULL);
     if (err) {
-        pr_err("zn-auditpatch-kpm: [p2] hook_wrap failed, err=%d, deep hook DISABLED\n", err);
+        pr_err("auditpatch-kpm: [p2] hook_wrap failed, err=%d, deep hook DISABLED\n", err);
         g_p2_addr = 0;
         return;
     }
 
     g_p2_hooked = 1;
-    pr_info("zn-auditpatch-kpm: [p2] deep hook installed on security_sid_to_context (abi=%s, has_state=%d)\n",
+    pr_info("auditpatch-kpm: [p2] deep hook installed on security_sid_to_context (abi=%s, has_state=%d)\n",
             abi->note, g_p2_has_state_arg);
 }
 
@@ -520,24 +532,40 @@ static long auditpatch_init(const char *args, const char *event, void *reserved)
 {
     hook_err_t err;
 
-    pr_info("zn-auditpatch-kpm: init, kver=0x%x, event=%s, args=%s\n", kver, event ? event : "(null)",
+    pr_info("auditpatch-kpm: init, kver=0x%x, event=%s, args=%s\n", kver, event ? event : "(null)",
             args ? args : "(null)");
 
-    if (args && args[0] != '\0') {
-        strncpy(g_target_comm, args, TASK_COMM_LEN - 1);
-        g_target_comm[TASK_COMM_LEN - 1] = '\0';
-        pr_info("zn-auditpatch-kpm: [p1] target comm overridden to '%s'\n", g_target_comm);
-    } else {
-        pr_info("zn-auditpatch-kpm: [p1] target comm defaults to '%s'\n", g_target_comm);
+    /* Defensive: KPM_INIT is only expected to run once per load, but
+     * nothing in this file enforces that on its own, and hook_syscalln()/
+     * hook_wrap() have no documented "already hooked, no-op" behavior for
+     * a second registration of the same before/after pair -- worst case
+     * that would silently stack a duplicate chain entry and run each hook
+     * callback twice per event. Cheap to guard against outright rather
+     * than rely on this never being reachable. */
+    if (g_p1_hooked || g_p1b_hooked || g_p2_hooked) {
+        pr_warn("auditpatch-kpm: init called while already hooked, ignoring (p1=%d p1b=%d p2=%d)\n", g_p1_hooked,
+                g_p1b_hooked, g_p2_hooked);
+        return 0;
     }
+
+    parse_args(args);
 
     err = hook_syscalln(__NR_recvfrom, 6, NULL, after_recvfrom, NULL);
     if (err) {
         g_p1_hooked = 0;
-        pr_err("zn-auditpatch-kpm: [p1] failed to hook recvfrom, err=%d\n", err);
+        pr_err("auditpatch-kpm: [p1] failed to hook recvfrom, err=%d\n", err);
     } else {
         g_p1_hooked = 1;
-        pr_info("zn-auditpatch-kpm: [p1] recvfrom hook installed\n");
+        pr_info("auditpatch-kpm: [p1] recvfrom hook installed\n");
+    }
+
+    err = hook_syscalln(__NR_read, 3, NULL, after_read, NULL);
+    if (err) {
+        g_p1b_hooked = 0;
+        pr_err("auditpatch-kpm: [p1b] failed to hook read, err=%d\n", err);
+    } else {
+        g_p1b_hooked = 1;
+        pr_info("auditpatch-kpm: [p1b] read hook installed\n");
     }
 
     install_deep_hook();
@@ -548,30 +576,152 @@ static long auditpatch_init(const char *args, const char *event, void *reserved)
     return 0;
 }
 
+/*
+ * Exercises PART 1's actual matching/replacement logic (try_patch_one) on
+ * synthetic buffers, so correctness can be checked on demand
+ * (`kpm ctl0 auditpatch-kpm selftest`) without waiting for a real
+ * su/magisk-domain AVC denial to happen to trigger it. Four cases:
+ *   1. a realistic su-domain denial line -> must patch
+ *   2. a realistic magisk-domain denial line -> must patch
+ *   3. su pattern embedded inside a quoted field (spoofing attempt) ->
+ *      must NOT patch (has_quote_after's whole job)
+ *   4. a denial line naming a *synthetic* extra domain ("ksu"), built the
+ *      same way parse_args() would build one from KPM args -> must patch.
+ *      Uses a purely local struct extra_domain, not g_extra_domains, so
+ *      this is safe to run regardless of what (if anything) was actually
+ *      configured at load time.
+ * Returns 1 if all four behaved as expected, 0 otherwise.
+ */
+static int run_selftest(void)
+{
+    char case1[256];
+    char case2[256];
+    char case3[256];
+    int len, patched, ok = 1;
+
+    len = snprintf(case1, sizeof(case1),
+                    "avc: denied { binder_transfer } for pid=1234 comm=\"some_app\" "
+                    "scontext=u:r:priv_app:s0 tcontext=u:r:su:s0 tclass=binder permissive=0");
+    patched = try_patch_one(case1, &len, (int)sizeof(case1) - 1, PATTERN_SU, (int)PATTERN_SU_LEN);
+    if (!patched || !strnstr(case1, CTX_REPLACEMENT, len)) {
+        pr_warn("auditpatch-kpm: [selftest] case 1 (su denial) FAILED\n");
+        ok = 0;
+    }
+
+    len = snprintf(case2, sizeof(case2),
+                    "avc: denied { binder_transfer } for pid=1234 comm=\"some_app\" "
+                    "scontext=u:r:priv_app:s0 tcontext=u:r:magisk:s0 tclass=binder permissive=0");
+    patched = try_patch_one(case2, &len, (int)sizeof(case2) - 1, PATTERN_MAGISK, (int)PATTERN_MAGISK_LEN);
+    if (!patched || !strnstr(case2, CTX_REPLACEMENT, len)) {
+        pr_warn("auditpatch-kpm: [selftest] case 2 (magisk denial) FAILED\n");
+        ok = 0;
+    }
+
+    len = snprintf(case3, sizeof(case3),
+                    "avc: denied { open } for path=\"tcontext=u:r:su:s0\" dev=\"sda1\" "
+                    "scontext=u:r:priv_app:s0 tcontext=u:r:sdcardfs:s0 tclass=file permissive=0");
+    patched = try_patch_one(case3, &len, (int)sizeof(case3) - 1, PATTERN_SU, (int)PATTERN_SU_LEN);
+    if (patched) {
+        pr_warn("auditpatch-kpm: [selftest] case 3 (anti-spoof) FAILED -- patched something it should not have\n");
+        ok = 0;
+    }
+
+    {
+        struct extra_domain d;
+        char case4[256];
+
+        memcpy(d.type, "ksu", 4);
+        d.raw_ctx_len = snprintf(d.raw_ctx, sizeof(d.raw_ctx), "u:r:%s:s0", d.type);
+        d.pattern_len = snprintf(d.pattern, sizeof(d.pattern), "tcontext=u:r:%s:s0", d.type);
+
+        len = snprintf(case4, sizeof(case4),
+                        "avc: denied { binder_transfer } for pid=1234 comm=\"some_app\" "
+                        "scontext=u:r:priv_app:s0 tcontext=u:r:ksu:s0 tclass=binder permissive=0");
+        patched = try_patch_one(case4, &len, (int)sizeof(case4) - 1, d.pattern, d.pattern_len);
+        if (!patched || !strnstr(case4, CTX_REPLACEMENT, len)) {
+            pr_warn("auditpatch-kpm: [selftest] case 4 (extra domain 'ksu') FAILED\n");
+            ok = 0;
+        }
+    }
+
+    pr_info("auditpatch-kpm: [selftest] %s\n", ok ? "all cases passed" : "one or more cases FAILED");
+    return ok;
+}
+
+/*
+ * compat_copy_to_user() itself has no truncation-safety: if the caller's
+ * out_msg buffer (outlen) is smaller than what we formatted (n+1 bytes
+ * including the NUL), copying exactly `outlen` raw bytes can leave the
+ * last byte un-terminated -- a real, if minor, footgun for any userspace
+ * caller that treats the result as a C string. Centralized here (rather
+ * than repeated at each of the three call sites below) so the fix can't
+ * accidentally apply to only some of them.
+ */
+static void copy_status_to_user(char *buf, int buf_cap, int n, char __user *out_msg, int outlen)
+{
+    int to_copy;
+
+    if (n < 0) n = 0;
+    if (n >= buf_cap) n = buf_cap - 1; /* snprintf's own truncation of buf itself */
+
+    if (n < outlen) {
+        to_copy = n + 1; /* string + NUL, fits as-is */
+    } else {
+        to_copy = outlen;
+        if (outlen > 0) buf[outlen - 1] = '\0'; /* force-terminate within what we're actually sending */
+    }
+    compat_copy_to_user(out_msg, buf, to_copy);
+}
+
 static long auditpatch_control0(const char *ctl_args, char *__user out_msg, int outlen)
 {
     char buf[320];
     int n;
 
+    if (outlen <= 0) return -EINVAL;
+
+    if (ctl_args && !strcmp(ctl_args, "selftest")) {
+        int ok = run_selftest();
+        n = snprintf(buf, sizeof(buf), "selftest: %s\n", ok ? "PASS" : "FAIL (see dmesg for which case)");
+        copy_status_to_user(buf, (int)sizeof(buf), n, out_msg, outlen);
+        return ok ? 0 : -EIO;
+    }
+
+    if (ctl_args && !strcmp(ctl_args, "domains")) {
+        int i, off = 0;
+        off += snprintf(buf + off, sizeof(buf) - off, "builtin: su, magisk\nextra (%d/%d):", g_extra_domain_count,
+                         MAX_EXTRA_DOMAINS);
+        for (i = 0; i < g_extra_domain_count && off < (int)sizeof(buf); i++) {
+            off += snprintf(buf + off, sizeof(buf) - off, " %s", g_extra_domains[i].type);
+        }
+        n = snprintf(buf + off, sizeof(buf) - off, "\n") + off;
+        copy_status_to_user(buf, (int)sizeof(buf), n, out_msg, outlen);
+        return 0;
+    }
+
     n = snprintf(buf, sizeof(buf),
-                 "p1_hooked=%d target=%s p1_scanned=%lld p1_patched=%lld p1_errors=%lld | "
+                 "p1_hooked=%d p1b_hooked=%d target=%s extra_domains=%d/%d p1_scanned=%lld p1_patched=%lld "
+                 "p1_errors=%lld p1b_scanned=%lld p1b_patched=%lld p1b_errors=%lld | "
                  "p2_hooked=%d p2_has_state=%d p2_patched=%lld p2_errors=%lld\n",
-                 g_p1_hooked, g_target_comm, (long long)atomic64_read(&g_p1_scanned),
-                 (long long)atomic64_read(&g_p1_patched), (long long)atomic64_read(&g_p1_errors), g_p2_hooked,
+                 g_p1_hooked, g_p1b_hooked, g_target_comm, g_extra_domain_count, MAX_EXTRA_DOMAINS,
+                 (long long)atomic64_read(&g_p1_scanned), (long long)atomic64_read(&g_p1_patched),
+                 (long long)atomic64_read(&g_p1_errors), (long long)atomic64_read(&g_p1b_scanned),
+                 (long long)atomic64_read(&g_p1b_patched), (long long)atomic64_read(&g_p1b_errors), g_p2_hooked,
                  g_p2_has_state_arg, (long long)atomic64_read(&g_p2_patched), (long long)atomic64_read(&g_p2_errors));
-    if (n < 0) n = 0;
-    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
 
     if (ctl_args && !strcmp(ctl_args, "reset")) {
         atomic64_set(&g_p1_scanned, 0);
         atomic64_set(&g_p1_patched, 0);
         atomic64_set(&g_p1_errors, 0);
+        atomic64_set(&g_p1b_scanned, 0);
+        atomic64_set(&g_p1b_patched, 0);
+        atomic64_set(&g_p1b_errors, 0);
         atomic64_set(&g_p2_patched, 0);
         atomic64_set(&g_p2_errors, 0);
         n = snprintf(buf, sizeof(buf), "counters reset\n");
     }
 
-    compat_copy_to_user(out_msg, buf, n < outlen ? n + 1 : outlen);
+    copy_status_to_user(buf, (int)sizeof(buf), n, out_msg, outlen);
     return 0;
 }
 
@@ -581,12 +731,17 @@ static long auditpatch_exit(void *__user reserved)
         unhook_syscalln(__NR_recvfrom, NULL, after_recvfrom);
         g_p1_hooked = 0;
     }
+    if (g_p1b_hooked) {
+        unhook_syscalln(__NR_read, NULL, after_read);
+        g_p1b_hooked = 0;
+    }
     if (g_p2_hooked && g_p2_addr) {
         unhook((void *)g_p2_addr);
         g_p2_hooked = 0;
     }
-    pr_info("zn-auditpatch-kpm: exit, p1_patched=%lld p2_patched=%lld\n",
-            (long long)atomic64_read(&g_p1_patched), (long long)atomic64_read(&g_p2_patched));
+    pr_info("auditpatch-kpm: exit, p1_patched=%lld p1b_patched=%lld p2_patched=%lld\n",
+            (long long)atomic64_read(&g_p1_patched), (long long)atomic64_read(&g_p1b_patched),
+            (long long)atomic64_read(&g_p2_patched));
     return 0;
 }
 

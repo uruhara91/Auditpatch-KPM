@@ -24,7 +24,7 @@ env:
   ARM_TOOLCHAIN_VERSION: "14.2.rel1"
   # Pinned KernelPatch commit the KPM headers are validated against.
   # https://github.com/bmax121/KernelPatch
-  KERNELPATCH_REF: "043c0c3bae68ddc6f2894b4e483d8f54cb85d112"
+  KERNELPATCH_REF: "7688cf806f25b408529ae985222a083e0e0d0ed6"
 
 jobs:
   lint:
@@ -64,19 +64,13 @@ jobs:
           ref: ${{ github.event.inputs.kernelpatch_ref != '' && github.event.inputs.kernelpatch_ref || env.KERNELPATCH_REF }}
           path: KernelPatch
 
-      # This is NOT the toolchain the release build uses (that's the
-      # official aarch64-none-elf- bare-metal ARM GNU Toolchain, downloaded
-      # in the `build` job below) -- it's Ubuntu's apt-installable
-      # aarch64-linux-gnu- cross-gcc, used here purely because it's a real
-      # AArch64-codegen-producing GCC that installs in seconds instead of
-      # minutes. It exists to catch real-codegen bugs (wrong relocation
-      # types, oversized stack frames, etc.) on every push/PR fast, before
-      # the slower official build runs. This is exactly the class of bug
-      # that -fsyntax-only in the `lint` job above cannot catch by
-      # construction (it never invokes an assembler) -- see README.md's
-      # Troubleshooting section for the real bug this caught during
-      # development (missing -fno-pic/-fno-pie caused GOT-relative
-      # relocations KernelPatch's loader silently rejects at boot).
+      # Not the release toolchain (that's the official aarch64-none-elf-
+      # bare-metal ARM GNU Toolchain in the `build` job below) -- this is
+      # Ubuntu's apt-installable aarch64-linux-gnu- cross-gcc, used purely
+      # because it produces real AArch64 codegen and installs in seconds.
+      # Catches real-codegen bugs (wrong relocation types, oversized stack
+      # frames) that -fsyntax-only in `lint` can't, by construction, catch.
+      # See DEBUGGING.md Bug 1 for the real bug this class of check caught.
       - name: Install apt aarch64 cross-gcc + binutils
         run: |
           sudo apt-get update -qq
@@ -97,23 +91,18 @@ jobs:
           INCLUDE_DIRS=". include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include"
           FLAGS=""
           for d in $INCLUDE_DIRS; do FLAGS="$FLAGS -I$GITHUB_WORKSPACE/KernelPatch/kernel/$d"; done
-          # Same CFLAGS the Makefile uses, plus -fstack-usage, compiled
-          # standalone here (not via `make`) purely to get the .su
-          # sidecar file without changing the Makefile itself. GCC names
-          # the .su file after the -o path (/tmp/su.o -> /tmp/su.su), not
-          # after the source file.
+          # Same CFLAGS as the Makefile plus -fstack-usage, compiled
+          # standalone to get the .su sidecar without touching the
+          # Makefile. GCC names it after the -o path, not the source file.
           cd kpm
           aarch64-linux-gnu-gcc -Wall -Wextra -O2 -fno-strict-aliasing -fno-builtin \
             -fno-stack-protector -fno-common -fno-asynchronous-unwind-tables \
             -fno-unwind-tables -fno-pic -fno-pie -fstack-usage $FLAGS -c -o /tmp/su.o auditpatch.c
           echo "Per-function stack usage (bytes):"
           sort -t "$(printf '\t')" -k2 -rn /tmp/su.su
-          # 2 KiB is generous headroom given the largest function here uses
-          # well under 512 B and a KPM hook runs on top of an unknown,
-          # already-partially-used kernel stack -- this exists to catch a
-          # future change (e.g. a large local buffer/array) accidentally
-          # eating into that shared budget, not because current usage is
-          # anywhere close to the limit.
+          # 2 KiB is generous headroom (largest function is well under
+          # 512 B); guards against a future change growing stack usage on
+          # top of an unknown, already-partially-used kernel stack.
           over=$(awk -F'\t' '$2 > 2048 {print}' /tmp/su.su || true)
           rm -f /tmp/su.su /tmp/su.o
           if [ -n "$over" ]; then
@@ -123,9 +112,26 @@ jobs:
           fi
           echo "OK: all functions well under the 2048 B/frame guard"
 
+  unit-test:
+    name: Unit test pure logic (host gcc, ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # patch_logic.h has no kernel dependency, so this runs as plain host
+      # code -- no cross toolchain needed. Exercises the exact bytes that
+      # ship in the .kpm. Complements, not replaces, on-device `ctl0
+      # selftest`, which also proves the hook plumbing works end to end.
+      - name: Build and run with ASan/UBSan
+        run: |
+          set -eu
+          cd kpm/tests
+          gcc -Wall -Wextra -O2 -fsanitize=address,undefined -o test_logic test_logic.c
+          ./test_logic
+
   build:
     name: Build .kpm (aarch64-none-elf)
-    needs: [lint, fast-check]
+    needs: [lint, fast-check, unit-test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

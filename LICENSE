@@ -1,7 +1,7 @@
-zn-auditpatch-kpm
+auditpatch-kpm
 Copyright (C) 2024 aviraxp (original ZN-AuditPatch module and string-
 replacement logic)
-Copyright (C) 2026 KernelPatch port contributors
+Copyright (C) 2026 aviraxp, uruhara91 (KernelPatch port)
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
