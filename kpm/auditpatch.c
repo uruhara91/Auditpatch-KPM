@@ -21,6 +21,13 @@
  * read() isn't inherently socket-scoped, so this can't cheaply confirm the
  * fd is really the audit socket -- see after_read() below.
  *
+ * PART 1c (unreleased): same technique again, applied to syslog(2)
+ * (bionic's klogctl()). AOSP's logd calls this once at startup to replay
+ * any AVC denials that were logged via printk() during early boot, before
+ * logd's own netlink listener (PART 1) existed -- that content never
+ * touches recvfrom() or read() at all. See after_syslog() and
+ * DEBUGGING.md for how this gap was found.
+ *
  * PART 2 (optional, version-gated): PART 1/1b only rewrite logd's
  * formatted log line. Every other SID->string lookup (e.g.
  * /proc/[pid]/attr/current) goes through security_sid_to_context() in
@@ -147,6 +154,16 @@ static atomic64_t g_p1b_scanned = ATOMIC64_INIT(0);
 static atomic64_t g_p1b_patched = ATOMIC64_INIT(0);
 static atomic64_t g_p1b_errors = ATOMIC64_INIT(0);
 static int g_p1b_hooked = 0;
+
+/* PART 1c: same technique again, applied to syslog(2) (bionic's klogctl()).
+ * logd calls this once at startup (KLOG_READ_ALL) to drain any AVC denials
+ * that were logged via printk() during early boot, before its own
+ * NETLINK_AUDIT listener (PART 1) was even running -- see the comment
+ * above after_syslog() and DEBUGGING.md for how this was found. */
+static atomic64_t g_p1c_scanned = ATOMIC64_INIT(0);
+static atomic64_t g_p1c_patched = ATOMIC64_INIT(0);
+static atomic64_t g_p1c_errors = ATOMIC64_INIT(0);
+static int g_p1c_hooked = 0;
 
 static atomic64_t g_p2_patched = ATOMIC64_INIT(0);
 static atomic64_t g_p2_errors = ATOMIC64_INIT(0);
@@ -411,6 +428,89 @@ static void after_read(hook_fargs3_t *args, void *udata)
     }
 }
 
+/*
+ * after-hook on syslog(int type, char *buf, int len) -- SYSCALL_DEFINE3(syslog, ...)
+ * in kernel/printk/printk.c, which bionic's klogctl() wraps.
+ *
+ * logd's main() calls klogctl(KLOG_READ_ALL, ...) exactly once at startup,
+ * before its NETLINK_AUDIT listener (PART 1) is running, specifically to
+ * replay any kernel ring-buffer content -- including AVC denials that were
+ * logged via printk() because nothing was listening on the audit netlink
+ * multicast group yet -- into its own log buffer (see readDmesg() in
+ * AOSP's logd/main.cpp). That content never touches recvfrom() or read():
+ * it arrives through this syscall alone, once, at boot. Confirmed against
+ * real kernel source (kernel/printk/printk.c) that syslog()'s argument
+ * layout is arg0=type, arg1=buf, arg2=len, ret=bytes written to buf on
+ * success -- structurally identical to read()'s (fd, buf, count), so this
+ * reuses the exact same scratch-buffer/try_patch_any() technique as
+ * after_read() above, not a new algorithm. See DEBUGGING.md for how this
+ * gap was found and what was actually checked before adding it.
+ *
+ * Deliberately does not filter on `type` (e.g. requiring the
+ * KLOG_READ_ALL value bionic happens to use today): a different `type`
+ * still returns kernel-ring-buffer text into the same flat `buf`, and
+ * gating on one specific integer would be exactly the kind of unverified,
+ * pattern-matched assumption this project's own ABI-table comments argue
+ * against. Same safety net as PART 1/1b instead: g_target_comm plus the
+ * pattern match itself.
+ */
+static void after_syslog(hook_fargs3_t *args, void *udata)
+{
+    long ret;
+    uint64_t buf_arg, cap_arg;
+    void __user *ubuf;
+    int user_cap;
+    long copied;
+    int len;
+    int patched;
+    char scratch[SCRATCH_BUF_SIZE];
+    struct task_struct *task;
+    const char *comm;
+
+    ret = (long)args->ret;
+    if (ret <= 0) return;
+
+    task = current;
+    if (!task) return;
+    comm = get_task_comm(task);
+    if (!comm) return;
+    if (strncmp(comm, g_target_comm, TASK_COMM_LEN)) return;
+
+    buf_arg = syscall_argn(args, 1);
+    if (!buf_arg) return;
+    ubuf = (void __user *)buf_arg;
+
+    cap_arg = syscall_argn(args, 2);
+    if (cap_arg == 0 || cap_arg > (uint64_t)(SCRATCH_BUF_SIZE - 1)) {
+        user_cap = SCRATCH_BUF_SIZE - 1;
+    } else {
+        user_cap = (int)cap_arg;
+    }
+    if (ret > user_cap) ret = user_cap;
+
+    if (ret + ALLOC_HEADROOM > (int)sizeof(scratch)) return;
+
+    atomic64_inc(&g_p1c_scanned);
+
+    copied = compat_strncpy_from_user(scratch, (const char __user *)ubuf, ret);
+    if (copied <= 0) return;
+
+    len = (int)copied;
+    patched = try_patch_any(scratch, &len, user_cap);
+
+    if (patched) {
+        if (compat_copy_to_user(ubuf, scratch, len) == 0) {
+            args->ret = (uint64_t)len;
+            atomic64_inc(&g_p1c_patched);
+            pr_info("auditpatch-kpm: [p1c] patched avc audit tcontext via syslog() in '%s' (total: %lld)\n", comm,
+                    (long long)atomic64_read(&g_p1c_patched));
+        } else {
+            atomic64_inc(&g_p1c_errors);
+            pr_err("auditpatch-kpm: [p1c] compat_copy_to_user failed\n");
+        }
+    }
+}
+
 /* ==========================================================================
  * PART 2: deep security_sid_to_context hook (version-gated)
  * ========================================================================== */
@@ -542,9 +642,9 @@ static long auditpatch_init(const char *args, const char *event, void *reserved)
      * that would silently stack a duplicate chain entry and run each hook
      * callback twice per event. Cheap to guard against outright rather
      * than rely on this never being reachable. */
-    if (g_p1_hooked || g_p1b_hooked || g_p2_hooked) {
-        pr_warn("auditpatch-kpm: init called while already hooked, ignoring (p1=%d p1b=%d p2=%d)\n", g_p1_hooked,
-                g_p1b_hooked, g_p2_hooked);
+    if (g_p1_hooked || g_p1b_hooked || g_p1c_hooked || g_p2_hooked) {
+        pr_warn("auditpatch-kpm: init called while already hooked, ignoring (p1=%d p1b=%d p1c=%d p2=%d)\n",
+                g_p1_hooked, g_p1b_hooked, g_p1c_hooked, g_p2_hooked);
         return 0;
     }
 
@@ -566,6 +666,15 @@ static long auditpatch_init(const char *args, const char *event, void *reserved)
     } else {
         g_p1b_hooked = 1;
         pr_info("auditpatch-kpm: [p1b] read hook installed\n");
+    }
+
+    err = hook_syscalln(__NR_syslog, 3, NULL, after_syslog, NULL);
+    if (err) {
+        g_p1c_hooked = 0;
+        pr_err("auditpatch-kpm: [p1c] failed to hook syslog, err=%d\n", err);
+    } else {
+        g_p1c_hooked = 1;
+        pr_info("auditpatch-kpm: [p1c] syslog hook installed\n");
     }
 
     install_deep_hook();
@@ -675,7 +784,15 @@ static void copy_status_to_user(char *buf, int buf_cap, int n, char __user *out_
 
 static long auditpatch_control0(const char *ctl_args, char *__user out_msg, int outlen)
 {
-    char buf[320];
+    /* 512, not 320: with p1c's three counters added, a worst-case status
+     * line (every counter at max digit width) is ~451 bytes -- was
+     * already tight at 320 even before p1c (snprintf() itself can't
+     * overflow buf regardless, and copy_status_to_user() clamps `n`
+     * defensively either way, so this was never a memory-safety issue --
+     * see the comment there), but sized here to comfortably fit the real
+     * worst case rather than relying on that clamp to silently drop
+     * fields from the diagnostic output. */
+    char buf[512];
     int n;
 
     if (outlen <= 0) return -EINVAL;
@@ -694,20 +811,22 @@ static long auditpatch_control0(const char *ctl_args, char *__user out_msg, int 
         for (i = 0; i < g_extra_domain_count && off < (int)sizeof(buf); i++) {
             off += snprintf(buf + off, sizeof(buf) - off, " %s", g_extra_domains[i].type);
         }
+        /* snprintf() returns the length it *would* have written, which can
+         * exceed the remaining space on truncation -- so `off` itself is not
+         * trustworthy as a byte offset once truncation has happened. Clamp
+         * before the final snprintf below: today's MAX_EXTRA_DOMAINS(4) *
+         * (MAX_EXTRA_DOMAIN_TYPE_LEN(31)+1) keeps the real total at 161
+         * bytes against a 320-byte buf, so this branch isn't reachable yet
+         * -- but a future bump to either constant without revisiting this
+         * function would otherwise turn `buf + off` into an out-of-bounds
+         * pointer and `sizeof(buf) - off` into a huge, size_t-underflowed
+         * length. Same "don't just trust it holds" standard as
+         * AUDITPATCH_TRUST_BUT_VERIFY in after_sid_to_context() below. */
+        if (off > (int)sizeof(buf)) off = (int)sizeof(buf);
         n = snprintf(buf + off, sizeof(buf) - off, "\n") + off;
         copy_status_to_user(buf, (int)sizeof(buf), n, out_msg, outlen);
         return 0;
     }
-
-    n = snprintf(buf, sizeof(buf),
-                 "p1_hooked=%d p1b_hooked=%d target=%s extra_domains=%d/%d p1_scanned=%lld p1_patched=%lld "
-                 "p1_errors=%lld p1b_scanned=%lld p1b_patched=%lld p1b_errors=%lld | "
-                 "p2_hooked=%d p2_has_state=%d p2_patched=%lld p2_errors=%lld\n",
-                 g_p1_hooked, g_p1b_hooked, g_target_comm, g_extra_domain_count, MAX_EXTRA_DOMAINS,
-                 (long long)atomic64_read(&g_p1_scanned), (long long)atomic64_read(&g_p1_patched),
-                 (long long)atomic64_read(&g_p1_errors), (long long)atomic64_read(&g_p1b_scanned),
-                 (long long)atomic64_read(&g_p1b_patched), (long long)atomic64_read(&g_p1b_errors), g_p2_hooked,
-                 g_p2_has_state_arg, (long long)atomic64_read(&g_p2_patched), (long long)atomic64_read(&g_p2_errors));
 
     if (ctl_args && !strcmp(ctl_args, "reset")) {
         atomic64_set(&g_p1_scanned, 0);
@@ -716,10 +835,28 @@ static long auditpatch_control0(const char *ctl_args, char *__user out_msg, int 
         atomic64_set(&g_p1b_scanned, 0);
         atomic64_set(&g_p1b_patched, 0);
         atomic64_set(&g_p1b_errors, 0);
+        atomic64_set(&g_p1c_scanned, 0);
+        atomic64_set(&g_p1c_patched, 0);
+        atomic64_set(&g_p1c_errors, 0);
         atomic64_set(&g_p2_patched, 0);
         atomic64_set(&g_p2_errors, 0);
         n = snprintf(buf, sizeof(buf), "counters reset\n");
+        copy_status_to_user(buf, (int)sizeof(buf), n, out_msg, outlen);
+        return 0;
     }
+
+    n = snprintf(buf, sizeof(buf),
+                 "p1_hooked=%d p1b_hooked=%d p1c_hooked=%d target=%s extra_domains=%d/%d p1_scanned=%lld "
+                 "p1_patched=%lld p1_errors=%lld p1b_scanned=%lld p1b_patched=%lld p1b_errors=%lld "
+                 "p1c_scanned=%lld p1c_patched=%lld p1c_errors=%lld | "
+                 "p2_hooked=%d p2_has_state=%d p2_patched=%lld p2_errors=%lld\n",
+                 g_p1_hooked, g_p1b_hooked, g_p1c_hooked, g_target_comm, g_extra_domain_count, MAX_EXTRA_DOMAINS,
+                 (long long)atomic64_read(&g_p1_scanned), (long long)atomic64_read(&g_p1_patched),
+                 (long long)atomic64_read(&g_p1_errors), (long long)atomic64_read(&g_p1b_scanned),
+                 (long long)atomic64_read(&g_p1b_patched), (long long)atomic64_read(&g_p1b_errors),
+                 (long long)atomic64_read(&g_p1c_scanned), (long long)atomic64_read(&g_p1c_patched),
+                 (long long)atomic64_read(&g_p1c_errors), g_p2_hooked, g_p2_has_state_arg,
+                 (long long)atomic64_read(&g_p2_patched), (long long)atomic64_read(&g_p2_errors));
 
     copy_status_to_user(buf, (int)sizeof(buf), n, out_msg, outlen);
     return 0;
@@ -735,13 +872,17 @@ static long auditpatch_exit(void *__user reserved)
         unhook_syscalln(__NR_read, NULL, after_read);
         g_p1b_hooked = 0;
     }
+    if (g_p1c_hooked) {
+        unhook_syscalln(__NR_syslog, NULL, after_syslog);
+        g_p1c_hooked = 0;
+    }
     if (g_p2_hooked && g_p2_addr) {
         unhook((void *)g_p2_addr);
         g_p2_hooked = 0;
     }
-    pr_info("auditpatch-kpm: exit, p1_patched=%lld p1b_patched=%lld p2_patched=%lld\n",
+    pr_info("auditpatch-kpm: exit, p1_patched=%lld p1b_patched=%lld p1c_patched=%lld p2_patched=%lld\n",
             (long long)atomic64_read(&g_p1_patched), (long long)atomic64_read(&g_p1b_patched),
-            (long long)atomic64_read(&g_p2_patched));
+            (long long)atomic64_read(&g_p1c_patched), (long long)atomic64_read(&g_p2_patched));
     return 0;
 }
 

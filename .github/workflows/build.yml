@@ -100,9 +100,9 @@ jobs:
             -fno-unwind-tables -fno-pic -fno-pie -fstack-usage $FLAGS -c -o /tmp/su.o auditpatch.c
           echo "Per-function stack usage (bytes):"
           sort -t "$(printf '\t')" -k2 -rn /tmp/su.su
-          # 2 KiB is generous headroom (largest function is well under
-          # 512 B); guards against a future change growing stack usage on
-          # top of an unknown, already-partially-used kernel stack.
+          # 2 KiB is generous headroom (largest measured function is 1632 B);
+          # guards against a future change growing stack usage on top of an
+          # unknown, already-partially-used kernel stack.
           over=$(awk -F'\t' '$2 > 2048 {print}' /tmp/su.su || true)
           rm -f /tmp/su.su /tmp/su.o
           if [ -n "$over" ]; then

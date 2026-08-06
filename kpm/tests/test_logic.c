@@ -173,9 +173,28 @@ static void test_sid2ctx_abi_table(void)
           sid2ctx_abi_lookup(VERSION(6, 3, 9), &abi) && abi->has_state_arg == 1);
     CHECK("6.4.0 (exactly at boundary) -> has_state=0",
           sid2ctx_abi_lookup(VERSION(6, 4, 0), &abi) && abi->has_state_arg == 0);
-    CHECK("4.14.180 (below table) -> unmatched, deep hook stays off", !sid2ctx_abi_lookup(VERSION(4, 14, 180), &abi));
+    CHECK("4.18.250 (just below 4.19 boundary) -> has_state=0",
+          sid2ctx_abi_lookup(VERSION(4, 18, 250), &abi) && abi->has_state_arg == 0);
+    CHECK("4.14.180 (mainline-verified pre-4.19 row) -> has_state=0",
+          sid2ctx_abi_lookup(VERSION(4, 14, 180), &abi) && abi->has_state_arg == 0);
+    CHECK("3.18.0 (exactly at table's lower bound) -> has_state=0",
+          sid2ctx_abi_lookup(VERSION(3, 18, 0), &abi) && abi->has_state_arg == 0);
+    CHECK("3.17.250 (below table, matches KernelPatch's own stated floor) -> unmatched, deep hook stays off",
+          !sid2ctx_abi_lookup(VERSION(3, 17, 250), &abi));
 
     CHECK("CTX_REPLACEMENT_SHORT never longer than CTX_SU", CTX_REPLACEMENT_SHORT_LEN <= strlen(CTX_SU));
+
+    /* VERSION()'s patch field spills into minor at patch>=256 (see the
+     * comment above SID2CTX_ABI_TABLE) -- confirm that behavior explicitly
+     * rather than only relying on it implicitly, and confirm real LTS
+     * branches' current patch counts don't cross a table boundary because
+     * of it. */
+    CHECK("VERSION() patch field spills into minor at 256+ (documented, not a bug)",
+          VERSION(4, 19, 325) == VERSION(4, 20, 69));
+    CHECK("android-4.19-stable @ 4.19.325 (patch > 255) still lands has_state=1, not spilled into 5.x",
+          sid2ctx_abi_lookup(VERSION(4, 19, 325), &abi) && abi->has_state_arg == 1);
+    CHECK("mainline v6.1 @ 6.1.148 (patch > 255) still lands has_state=1, not spilled past 6.4 boundary",
+          sid2ctx_abi_lookup(VERSION(6, 1, 148), &abi) && abi->has_state_arg == 1);
 }
 
 int main(void)

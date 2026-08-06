@@ -206,8 +206,36 @@ struct sid2ctx_abi {
  * branches) before being added -- see the PART 2 comment in auditpatch.c
  * for exactly which ones. Do not add a row "by pattern-matching" the ones
  * around it; verify it the same way first.
+ *
+ * VERSION()'s patch field is a plain 8-bit-wide addition (see above), not
+ * masked -- inherited from KernelPatch's own macro, not something this
+ * module chose. A patch/sublevel number >= 256 (real for actively
+ * maintained LTS branches -- android-4.19-stable alone has passed 300)
+ * numerically spills into the minor field, e.g. VERSION(4,19,325) ==
+ * VERSION(4,20,69). Checked against every real LTS branch's current patch
+ * count at the time each row's boundary was set: none of them spills far
+ * enough to cross a row boundary above (see DEBUGGING.md's audit notes
+ * for the specific numbers checked). If a future table edit moves a
+ * boundary to sit at (LTS-minor + 1).0, re-check this before assuming the
+ * new boundary is safe from the same class of spill.
  */
 static const struct sid2ctx_abi SID2CTX_ABI_TABLE[] = {
+    /* mainline v3.10/v3.18/v4.4/v4.9/v4.14 (pre state-encapsulation --
+     * that refactor landed exactly at v4.19). Lower bound matches
+     * KernelPatch's own documented floor ("Linux 3.18 - 6.6 theoretically"
+     * in its README) rather than mainline's actual origin of this
+     * signature, which goes back further still. NOTE: unlike every other
+     * row in this table, this one is mainline-verified only -- the
+     * matching Android common-kernel branches (android-3.18, android-4.4,
+     * android-4.9, android-4.14) could not be cross-checked in the
+     * environment this was added from (android.googlesource.com isn't
+     * reachable there, and the available GitHub mirror doesn't carry
+     * branches this old). security_sid_to_context()'s signature is core
+     * SELinux glue, not something OEMs have a reason to fork, so risk is
+     * assessed low -- but treat this specific row as lower-confidence
+     * than the others until confirmed against a real device or an actual
+     * Android common-kernel branch for this era. */
+    { VERSION(3, 18, 0), VERSION(4, 19, 0), 0, "3.18.x-4.18.x (mainline-verified only, see note above)" },
     /* android-4.19-stable and mainline v4.19 (covers e.g. 4.19.191) */
     { VERSION(4, 19, 0), VERSION(5, 0, 0), 1, "4.19.x" },
     /* android-5.4-stable, android12-5.10, android13-5.15, android14-6.1,
